@@ -1,0 +1,253 @@
+================================================================================
+  HEAT3 REMOTE CONTROL DIAGNOSTIC — PROJECT SUMMARY
+  For: Claude (AI assistant context handoff file)
+  Project: TAMA Labs — HEAT3 Dual Mode Heating Power Supply
+  Date: 2026-05-06
+================================================================================
+
+PURPOSE OF THIS FILE
+--------------------
+This file summarizes the entire debugging session for HEAT3 remote control
+via RS232/Modbus RTU. It is written so any AI assistant (e.g. Claude) can
+immediately understand the device, the problem, and the current code state
+without needing the full conversation history.
+
+
+================================================================================
+DEVICE OVERVIEW
+================================================================================
+
+Device   : PREVAC HEAT3 Dual Mode Heating Power Supply
+Firmware : v4.10  (manual rev. 1, document no. 1035724, November 2021)
+Transport: RS232 serial, 19200 baud, 8N1, Modbus RTU (slave ID = 1 by default)
+Port     : COM12 (on the TAMA Labs control PC)
+Channel  : CH2 is the active heating channel being controlled
+
+The HEAT3 uses TWO separate protocol layers on the SAME serial port:
+  1. Modbus RTU  — for reading/writing all parameter registers (SP, PV, etc.)
+  2. PREVAC V2   — a proprietary framing protocol for session management
+                   (host registration, MASTER mode claim/release)
+
+
+================================================================================
+KEY REGISTERS (Modbus, 0-based addresses)
+================================================================================
+
+  reg1000  = MASTER reflect    (READ ONLY after PREVAC V2 handshake)
+               0 = no master / local mode
+               1 = a host currently holds MASTER
+  reg1151  = Remote Enable     (READ/WRITE)
+               0 = Remote control disabled (front panel only)
+               1 = Remote control enabled
+  reg1200  = CH2 Setpoint (SP)  in units of K*100  (e.g. 35815 = 358.15K = 85.00°C)
+  reg1201  = CH2 Process Value (PV)  same units
+
+  Temperature encoding:
+    raw = round((celsius + 273.15) * 100)
+    celsius = (raw / 100.0) - 273.15
+
+
+================================================================================
+PREVAC V2 PROTOCOL (critical — this is the piece that was missing)
+================================================================================
+
+Frame format: BB | LEN | C8 | SLAVE | OH | OL | DATA... | CRC
+  BB      = 0xBB (fixed header)
+  LEN     = number of bytes from C8 to end of DATA (inclusive)
+  C8      = 0xC8 (fixed)
+  SLAVE   = device slave address (e.g. 0x01)
+  OH, OL  = order number high/low byte
+  DATA    = optional payload bytes
+  CRC     = sum of all bytes after 0xBB header, mod 256
+
+Key PREVAC V2 Orders:
+  0x7FF0  — Host Number Assign (WRITE with ASCII unique ID string)
+              Device responds with assigned host address (1–255)
+              MUST be called before MASTER can be claimed
+  0x7FF1  — MASTER Mode (READ or WRITE)
+              READ response byte bit fields (Table 6.48):
+                B0 = we are currently MASTER
+                B1 = claim is permitted  (requires B2=1, B3=1, B4=0)
+                B2 = Remote Control mode is active on device
+                B3 = this host is registered (0x7FF0 has been called)
+                B4 = a different host currently holds MASTER
+              WRITE with payload 0x01 = claim MASTER
+              WRITE with payload 0x00 = release MASTER
+
+MASTER keepalive rule:
+  Device drops MASTER if no communication for >10 seconds.
+  Solution: background thread re-asserts MASTER every 5 seconds.
+  Thread must be PAUSED when testing local-mode rejection (Step 5/6).
+
+
+================================================================================
+WHAT WENT WRONG IN v3 (and all earlier versions)
+================================================================================
+
+SYMPTOM:
+  reg1151 (Remote Enable) reads = 1  (ENABLED)
+  reg1000 (MASTER) reads = 0         (free)
+  Writing 1 to reg1000 via Modbus → readback still 0 → MASTER claim FAILED
+
+ROOT CAUSE:
+  Writing to Modbus reg1000 is IGNORED by the device if no host has
+  registered via PREVAC V2 order 0x7FF0 first.
+
+  The device's internal gate for MASTER claim:
+    B1 (permitted) = 1  ONLY IF  B2=1 AND B3=1 AND B4=0
+    B3 (registered) was 0 because 0x7FF0 had never been called.
+
+  All previous diagnostic versions assumed Modbus reg1000 was directly
+  writable, but it is only a READ-ONLY REFLECTION of the PREVAC V2 state.
+  The MASTER state machine lives entirely in the PREVAC V2 layer.
+
+FIX:
+  Must send PREVAC V2 frame for 0x7FF0 (host registration) FIRST,
+  then send PREVAC V2 frame for 0x7FF1 = 1 (claim MASTER).
+  After that, Modbus register reads/writes work normally.
+
+
+================================================================================
+DIAGNOSTIC FILE: heat3_remote_diag_v4.py
+================================================================================
+
+FILE PURPOSE:
+  A standalone Python diagnostic that:
+  (a) Verifies the PREVAC V2 host registration and MASTER claim sequence works
+  (b) Tests writing a setpoint while REMOTE/MASTER is active
+  (c) Tests that writes are rejected (or detects if they are not) in LOCAL mode
+  (d) Restores the original setpoint and releases MASTER cleanly
+
+DEPENDENCIES:
+  - pymodbus  (pip install pymodbus)
+  - pyserial  (installed as pymodbus dependency)
+  - Python 3.10+ (uses int | None type hint syntax)
+
+USAGE:
+  python heat3_remote_diag_v4.py <port> <baud> <slave_id> <test_sp_c> [channel]
+  Example:
+    python heat3_remote_diag_v4.py COM12 19200 1 75.0 2
+
+HOW IT WORKS — STEP BY STEP:
+
+  PRE-CHECK
+    Reads reg1151 (Remote Enable) and CH2 baseline SP/PV via Modbus.
+    Aborts immediately if Remote Enable = 0 with front-panel instructions.
+
+  STEP 0 — Read MASTER status (pre-registration)
+    Sends PREVAC V2 READ for 0x7FF1.
+    Decodes all 5 bit fields and prints them.
+    If PREVAC V2 gets no response → falls back to Modbus-only path.
+    If B2=0 → device Remote Control is OFF → aborts with message.
+
+  STEP 1 — Host registration (0x7FF0)
+    Sends PREVAC V2 WRITE for 0x7FF0 with unique ID "TAMA_DIAG_v4".
+    Device responds with an assigned host address (1–255).
+    This sets B3=1 inside the device, enabling the MASTER claim gate.
+
+  STEP 2 — Re-read MASTER status (post-registration)
+    Re-reads 0x7FF1 to confirm B3=1 (registered) and B1=1 (permitted).
+    If B4=1 → another host holds MASTER → aborts gracefully.
+    If B1=0 still → prints all bit values to help diagnose why.
+
+  STEP 3 — Claim MASTER
+    Sends PREVAC V2 WRITE for 0x7FF1 = 0x01.
+    Starts the keepalive background thread (re-asserts every 5 s).
+    Confirms via Modbus reg1000 that it now reads = 1.
+
+  STEP 4 — Write SP while REMOTE ON
+    Writes TEST_SP_C (user-supplied, e.g. 75.0°C) to CH2 SP register.
+    Reads back and confirms the value was accepted.
+
+  STEP 5 — Release MASTER (go LOCAL)
+    Pauses keepalive thread FIRST (so it doesn't immediately re-claim).
+    Sends PREVAC V2 WRITE for 0x7FF1 = 0x00 to release MASTER.
+    Confirms reg1000 = 0 (LOCAL mode).
+
+  STEP 6 — Write SP while LOCAL
+    Writes TEST_SP_C + 10°C to CH2 SP register.
+    Expected: device rejects it (readback stays at TEST_SP_C).
+    If accepted: prints [UNEXPECTED!] with explanation — some firmware
+    versions accept SP writes in local mode but gate OPERATE commands.
+
+  STEP 7 — Re-claim MASTER and restore original SP
+    Resumes keepalive, re-claims MASTER via PREVAC V2.
+    Writes original_sp back to CH2 SP register.
+    Confirms readback matches original.
+
+  STEP 8 — Final state dump
+    Prints reg1151, reg1000, CH2 SP, CH2 PV.
+    Reports PASSED or flags any mismatch.
+
+  FINALLY (cleanup, always runs even on exception)
+    Stops keepalive thread.
+    Releases MASTER via PREVAC V2 (or Modbus fallback).
+    Closes serial port.
+
+IMPORTANT IMPLEMENTATION DETAIL:
+  pymodbus ModbusSerialClient stores its serial socket as mb.socket.
+  The script accesses this socket directly to write raw PREVAC V2 bytes,
+  so no second serial port or second library is needed. Both protocols
+  share the same physical RS232 connection.
+
+  PREVAC V2 CRC = sum of all frame bytes AFTER the 0xBB header, mod 256.
+  (Not the same as Modbus CRC-16.)
+
+
+================================================================================
+WHAT TO DO NEXT / OPEN QUESTIONS
+================================================================================
+
+1. RUN THE DIAGNOSTIC
+   Run heat3_remote_diag_v4.py on COM12 and check:
+   - Does Step 1 (0x7FF0) return a valid host address (1–255)?
+   - Does Step 3 confirm reg1000 = 1 after MASTER claim?
+   - Does Step 4 accept the SP write?
+   If any step fails, the printed bit fields from Step 0/2 will tell you
+   exactly which precondition is not met.
+
+2. IF PREVAC V2 IS NOT ACTIVE ON THIS PORT
+   Some HEAT3 configurations use PREVAC V2 only on Ethernet (TCP/IP)
+   and Modbus RTU only on RS232. If Step 0 gets no response to 0x7FF1:
+   - Check the HEAT3 front panel: Setup → Interface → RS232 → Protocol
+   - It should show "PREVAC V2" or "PREVAC V2 + Modbus"
+   - If set to "Modbus only", MASTER can only be claimed via Ethernet
+
+3. KEEPALIVE TIMING
+   The 10-second timeout is stated in the manual.
+   The keepalive fires every 5 seconds (50% of timeout = safe margin).
+   If the PC is under heavy load and keepalive misses a beat, the device
+   will drop to LOCAL. Consider reducing to 3 seconds if this is a problem.
+
+4. INTEGRATION INTO MAIN MEASUREMENT CODE
+   When integrating, the correct sequence is:
+     a) Open serial port
+     b) prevac_register_host(ser, slave)
+     c) prevac_claim_master(ser, slave)
+     d) Start keepalive thread
+     e) Do all Modbus reads/writes normally
+     f) prevac_release_master(ser, slave) on exit
+     g) Stop keepalive thread
+     h) Close port
+
+5. SETPOINT REJECTION IN LOCAL MODE
+   If Step 6 shows [UNEXPECTED!] (SP write accepted in LOCAL mode):
+   The device may only gate OPERATE/RUN commands via MASTER, not SP writes.
+   This is firmware-version dependent. In that case, never write SP without
+   holding MASTER as a design discipline even if the device allows it.
+
+
+================================================================================
+FILE HISTORY
+================================================================================
+  v1–v2  : Basic Modbus read/write test — no remote mode awareness
+  v3     : Added Remote Enable check, MASTER claim via reg1000, keepalive
+           FAILED: reg1000 write ignored without PREVAC V2 registration
+  v4     : FIXED — Full PREVAC V2 handshake (0x7FF0 → 0x7FF1)
+           Proper host registration before MASTER claim
+           Graceful fallback to Modbus-only if PREVAC V2 not active
+           Full bit-field decode of 0x7FF1 status for diagnosis
+
+================================================================================
+END OF SUMMARY
+================================================================================

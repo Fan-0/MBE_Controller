@@ -1,0 +1,6 @@
+PyQt5>=5.15.0
+pyqtgraph>=0.13.0
+pyserial>=3.5
+minimalmodbus>=2.0.0
+openpyxl>=3.0.0
+pyinstaller>=5.0.0

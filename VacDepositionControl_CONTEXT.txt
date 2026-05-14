@@ -1,0 +1,1822 @@
+################################################################################
+# VACUUM DEPOSITION CONTROL SYSTEM — AI CONTEXT FILE
+# Purpose: Full project context for Claude Code / AI assistants
+# Generated from: VacDepositionControl source + HEAT3/BRAX3400 hardware manuals
+# Use this file as project knowledge or paste at start of any coding session
+################################################################################
+
+================================================================================
+SECTION 1: PROJECT IDENTITY
+================================================================================
+
+PROJECT: CovAP Lab Vacuum Deposition Controller
+TOOL:    MBE / Physical Vapor Deposition (PVD) system — Selenium + Indium sources
+STACK:   Python 3.11 / PyQt5 / pyqtgraph / pyserial / openpyxl / PyInstaller
+ENTRY:   python vac_control/main.py
+BUILD:   pyinstaller build.spec  → dist/VacDepositionControl.exe (Windows)
+TESTS:   python test_recipe.py   (headless, mocks serial/modbus)
+
+FILE TREE:
+  vac_control/
+    main.py                  # entry point, dark theme, logging config
+    gui_app.py               # MainWindow (PyQt5), all UI, timers, signal bridge
+    recipe_engine.py         # thread state machine: IDLE→RUNNING→PAUSED→DONE/ERROR
+    recipe_logger.py         # 1Hz logger during run → 5-sheet .xlsx export (incl. BEP Fast Trace)
+    bep_manager.py           # BEP measurement workflow (20Hz fast sampling)
+    data_logger.py           # background CSV logger + deque plot buffers
+    CovapDuty_v2.ino         # Arduino firmware (standalone copy at root)
+    CovapDuty_v2/            # Arduino sketch folder (IDE-compatible)
+    devices/
+      heat3.py               # HEAT3 Modbus RTU driver (real hardware)
+      brax3400.py            # B-RAX 3400 RS-485 ASCII driver (real hardware)
+      arduino_shutter.py     # Arduino serial ASCII driver (real hardware)
+      epc3004.py             # Eurotherm EPC3004 single-loop PID driver (Indium source)
+      sim_devices.py         # BRAX3400Sim, HEAT3Sim, ArduinoShutterSim, EPC3004Sim (test mode)
+      __init__.py
+    diagnostics/
+      timing_diag.py         # poll-cycle timing benchmark (run standalone, no GUI)
+      plot_diag.py           # GUI plot pipeline diagnostic (no hardware needed)
+      heat3_diag.py          # HEAT3 CH2 setpoint investigation tool
+      heat3_remote_test.py   # HEAT3 remote-enable diagnostic (PREVAC V2 protocol)
+      heat3_remote_watchdog.py # HEAT3 watchdog / sequence simulator
+    recipes/
+      create_recipe_template.py  # generates sample recipe.xlsx
+      recipe.xlsx / recipe_template.xlsx / *.xlsx  # saved recipes + run logs
+      bep_log.csv            # cumulative BEP measurement history
+    logs/                    # all output files: CSV logs + recipe Excel exports
+    manuals/
+      Heat3_UserManual.pdf / .txt
+      VacDepositionControl_TechnicalManual.pdf
+
+DEPENDENCIES (requirements.txt):
+  PyQt5>=5.15.0
+  pyqtgraph>=0.13.0
+  pyserial>=3.5
+  openpyxl>=3.0.0
+  pyinstaller>=5.0.0   # build only
+
+================================================================================
+SECTION 2: HARDWARE — HEAT3 DUAL-MODE HEATING POWER SUPPLY
+================================================================================
+
+MANUFACTURER: Prevac
+PROTOCOL:     Modbus RTU over RS-485
+BAUD:         19200, 8N1  (was 57600 in earlier config — confirmed 19200 on lab unit)
+SLAVE ID:     1
+SERIAL TIMEOUT: 0.25s  (was 1.0s — reduced for speed)
+RESPONSE BYTES:  read exactly `expected` bytes — NOT max(expected,8) which caused 0.25s
+                 timeout on every 7-byte response (1-register FC 0x03 reads)
+TRANSACT SLEEP: 0.01s after write, before read (was 0.04s — RS-485 turnaround headroom)
+INTER-WRITE SLEEP: 0.01s between two 16-bit words of an INT32 (fallback FC 0x06×2 path)
+READBACK DELAY:    0.30s after writing setpoint before verify read
+
+CHANNEL ASSIGNMENT:
+  CH1 = Selenium (Se) evaporation source
+  CH2 = Substrate heater
+
+TEMPERATURE ENCODING (critical):
+  All temp registers = INT32, unit = Kelvin × 100 (signed)
+  raw → °C:  raw / 100.0 - 273.15
+  °C → raw:  round((°C + 273.15) * 100)
+  INT32 split into TWO consecutive 16-bit registers:
+    reg N   = high word (MSW)
+    reg N+1 = low word  (LSW)
+  WRITE METHOD: two separate FC 0x06 single-register writes (NOT FC 0x10)
+  REASON: Some HEAT3 firmware returns non-standard FC 0x10 responses
+
+MODBUS FUNCTION CODES USED:
+  FC 0x03  read holding registers (response: 3 + n*2 + 2 bytes)
+  FC 0x06  write single register  (response: 8 bytes = echo of request)
+  FC 0x10  NOT USED (firmware compatibility issue)
+
+CRC: CRC-16 Modbus (polynomial 0xA001), appended little-endian
+
+EXCEPTION FRAME: 5 bytes (addr, FC|0x80, error_code, CRC×2)
+  Codes: 1=illegal fn, 2=illegal addr, 3=illegal data, 4=device error, 5=busy
+
+REGISTER MAP — CH1 (Selenium):
+  R_STATUS1    =  0   INT16 R   bit0=OPERATE state, bit3=no TC1, bit4=no TC2
+  R_PID_ST1    =  1   UINT8 R   0=Off, 1=Run, 2=Hold
+  R_PV1        =  2   INT32 R   process value (current temp), regs 2–3
+  R_TC1        =  4   INT32 R   thermocouple TC1, regs 4–5
+  R_TC2        =  6   INT32 R   thermocouple TC2, regs 6–7
+  R_SP1        = 14   INT32 R/W PID setpoint (T mode), regs 14–15; INT32 K×100
+  R_WMODE1     = 21   UINT8 R/W 0=Manual,1=Auto,2=External(RO),3=PIDOut(RO)
+  R_OP1        = 70   UINT8 W   write 1 → enter OPERATE state
+  R_STBY1      = 71   UINT8 W   write 1 → enter STANDBY state
+  R_PIDRUN1    = 72   UINT8 W   write 1 → start PID regulation
+  R_PIDHOLD1   = 73   UINT8 W   write 1 → hold PID
+  R_RAMP1      = 43   INT16 R/W PID SP ramp rate; stored as rate×10 in R_RAMP_UNIT1 units
+  R_RAMP_UNIT1 = 44   UINT8 R/W ramp unit: 0=per/s, 1=per/min, 2=per/h
+  R_OUT1       = 151  INT16 R   PID output % (value × 100 = %)
+  R_WATTS1     = 248  INT16 R   output power (value × 100 = W)
+
+REGISTER MAP — CH2 (Substrate):
+  R_STATUS2    = 84   INT16 R   same bit layout as STATUS1
+  R_PID_ST2    = 87   UINT8 R
+  R_PV2        = 88   INT32 R   regs 88–89
+  R_SP2        = 90   INT32 R/W regs 90–91
+  R_WMODE2     = 97   UINT8 R/W same values as WMODE1
+  R_OP2        = 114  UINT8 W   write 1 → OPERATE
+  R_STBY2      = 115  UINT8 W   write 1 → STANDBY
+  R_PIDRUN2    = 116  UINT8 W   write 1 → PID RUN
+  R_PIDHOLD2   = 117  UINT8 W   write 1 → PID HOLD
+  R_RAMP2      = 101  INT16 R/W PID SP ramp rate for CH2 (**); same encoding as R_RAMP1
+  R_RAMP_UNIT2 = 102  UINT8 R/W ramp unit for CH2: 0=per/s, 1=per/min, 2=per/h
+  R_OUT2       = 153  INT16 R   PID output %
+  R_WATTS2     = 249  INT16 R   output power
+
+DEVICE-INTERNAL SP RAMP RATE (regs 43/44 CH1, 101/102 CH2):
+  Controls how fast HEAT3 transitions to a newly written SP internally.
+  Encoding:  stored_value = actual_rate × 10  (e.g. 4 °C/min → write 40)
+  Unit reg:  0 = per/s, 1 = per/min (always write 1), 2 = per/h
+  0 = instant (ramping disabled — SP jumps immediately).
+  Factory defaults: CH1(Se) = 4 °C/min (stored 40), CH2(Sub) = 100 °C/min (stored 1000).
+  API: heat3.read_ramp_rate(ch) → float °C/min
+       heat3.write_ramp_rate(ch, rate_per_min) → bool
+  GUI: "Dev Ramp" spinbox + "Set" button on each TempCh panel.
+       Spinboxes are auto-populated when HEAT3 connects (or test mode activates).
+
+REGISTER MAP — GLOBAL:
+  R_REMOTE   = 1000 UINT8 R    read-only mirror of REMOTE state (writes ACK'd but ignored)
+  R_REM_EN   = 1151 UINT8 R    1 = Remote Enable is ON in device menu
+
+REMOTE MASTER PROTOCOL (confirmed by diagnostics 2026-05-06):
+  REQUIRED PREREQUISITE: Set Remote Enable ON from device front panel:
+    Settings → Communication → Remote Enable → ON
+    (Software CANNOT enable this remotely)
+  R_REMOTE (reg 1000) IS READ-ONLY on this firmware.
+    Writing 1 to it is ACK'd but has no effect — reg stays 0.
+    Modbus writes (SP, WMODE, OPERATE etc.) work regardless of reg 1000.
+  MAINTAIN:  send ANY Modbus frame within 10s (device drops REMOTE after 10s silence)
+             The 0.5s poller's FC 0x03 reads are sufficient keepalive.
+  DO NOT WRITE reg 1000 = 0 on disconnect — on some firmware this permanently
+    disables Remote Enable in the device settings (requires front-panel fix).
+
+APPLY SETPOINT SEQUENCE (apply_setpoint(ch, celsius)):
+  1. write 1 → WMODE[ch]           (ensure Auto mode)
+  2. sleep 0.02s
+  3. write INT32 → SP[ch]          (FC 0x10 preferred, FC 0x06×2 fallback)
+  4. sleep 0.30s                   (device latches SP before readback)
+  5. read SP[ch] back, verify |readback - target| < 1°C
+  Returns: {"ok": bool, "readback": float|None, "message": str}
+
+GO OPERATE SEQUENCE (go_operate(ch)):
+  write WMODE[ch]=1 → OP[ch]=1 → PIDRUN[ch]=1
+  read STATUS[ch] bit0 to confirm OPERATE state
+  Returns: {"ok": bool, "message": str}
+
+GO STANDBY (go_standby(ch)):
+  write STBY[ch]=1
+  Returns: {"ok": bool, "message": str}
+
+BATCH POLL (poll_all()) — used by Poller for speed:
+  Read 1: CH1 regs 0–21  (22 words, 1 FC 0x03) → STATUS1, PV1, SP1
+  Read 2: CH2 regs 84–97 (14 words, 1 FC 0x03) → STATUS2, PV2, SP2
+  Read 3: regs 151–153   ( 3 words, 1 FC 0x03) → R_OUT1, R_OUT2
+  Returns dict: {ch1_pv, ch1_sp, ch1_op, ch1_out, ch2_pv, ch2_sp, ch2_op, ch2_out}
+  3 transactions vs 8 individual reads → ~4× faster poller cycle
+  IMPLEMENTED in heat3.py; Poller in gui_app.py uses hasattr(h,'poll_all') guard
+  HEAT3Sim does NOT implement poll_all() — Poller falls back to individual reads for sim
+
+THREADING LOCKS IN HEAT3 DRIVER:
+  _port_lock  (Lock): one Modbus transaction at a time (low level)
+  _seq_lock   (Lock): held for entire multi-step sequences (apply_setpoint, go_operate)
+  _safe_read acquires _seq_lock with timeout=0.15s before individual reads
+  Heartbeat acquires _seq_lock non-blocking (skip if sequence in progress)
+
+DEBUG: heat3.debug_callback = callable(str) → receives "TX: XX XX XX" / "RX: XX XX XX"
+
+================================================================================
+SECTION 3: HARDWARE — B-RAX 3400 VACUUM GAUGE (InstruTech)
+================================================================================
+
+MANUFACTURER: InstruTech
+SENSORS:      Ion Gauge (IG) + Convectron CG1 + Convectron CG2 + Analog Input
+PROTOCOL:     InstruTech RS-485 ASCII (COMM Type = RS485)
+BAUD:         19200, 8N1
+ADDRESS:      01 (hex, 00–FF, factory default = 01, configurable)
+DEFAULT PORT: COM11 (Prolific PL2303GT USB-RS485 adapter — confirmed by COM scan)
+              NOTE: was incorrectly assumed COM9; use serial.tools.list_ports to discover
+SERIAL TIMEOUT: 0.25s  (was 1.0s — reduced for speed)
+COMMAND SLEEP:  0.02s after write, before read_until (was 0.06s)
+RESPONSE TERM:  \r  (carriage return, NOT \n) — use read_until(b'\r') not readline()
+                readline() waits for \n and always times out on BRAX responses
+
+FRAME FORMAT:
+  Command:  #AA<CMD>\r    (AA = 2-char hex address, e.g. "01")
+  Response: *AA <value>\r (13 chars total including \r, fixed-length)
+  Error:    ?AA <error>\r  (invalid cmd or out-of-range)
+
+RESPONSE PARSING (_parse_pressure):
+  Strip leading '*', skip 3 chars (2-char address + space), float(remainder)
+  Returns None for responses starting with '?' or '!'
+  Example: "*01 1.53E-06\r" → strip '*' → "01 1.53E-06" → skip 3 → "1.53E-06" → 1.53e-6
+
+KEY COMMANDS:
+  #01RDIG\r   read ion gauge pressure (Torr)
+              returns 1.10E+03 if IG off or sensor disconnected
+  #01RDCG1\r  read convectron gauge 1
+  #01RDCG2\r  read convectron gauge 2
+  #01RDAI\r   read analog input
+  #01IG1\r    turn IG ON  → response: "*01 PROGM_OK\r"
+  #01IG0\r    turn IG OFF (also clears IG error flags)
+  #01IGS\r    query IG state → "*01 1 IG_ON \r" or "*01 0 IG_OFF\r"
+  #01RSIG\r   IG diagnostic: 00=OK, 01=OVPRS, 02=EMISS, 04=FLVLO,
+              08=FLOPN, 10=DEGAS, 20=ICLOW, 40=FLIHI
+  #01DG1\r    start IG degas (requires IG on, P < 5e-5 Torr)
+  #01DG0\r    stop IG degas
+  #01DGS\r    query degas state
+  #01VER\r    firmware version
+
+IG INTERLOCK: Cannot enable IG if P > 1e-3 Torr (100µA emission) or 5e-4 Torr (4mA)
+              Send #01IG0\r first to clear error flags, then #01IG1\r
+
+================================================================================
+SECTION 4: HARDWARE — ARDUINO SHUTTER CONTROLLER
+================================================================================
+
+FIRMWARE:  CovapDuty_v2.ino (MUST flash this; original CovapDuty.ino won't work)
+           Export from: GUI Help → Export Arduino Firmware
+HARDWARE:  Arduino Uno, relays active-LOW
+           In shutter = pin 10,  Se shutter = pin 7
+BAUD:      9600, 8N1
+LINE END:  \n (LF) after each command
+BOOT WAIT: 2s after serial connect (Arduino resets on DTR assertion)
+TIMEOUT:   2.0s per command
+
+COMMANDS AND RESPONSES:
+  IN_ON    → OK:IN_ON       open In shutter  (pin 10 LOW)
+  IN_OFF   → OK:IN_OFF      close In shutter (pin 10 HIGH)
+  SE_ON    → OK:SE_ON       open Se shutter  (pin 7 LOW)
+  SE_OFF   → OK:SE_OFF      close Se shutter (pin 7 HIGH)
+  BOTH_ON  → OK:BOTH_ON     open both
+  BOTH_OFF → OK:BOTH_OFF    close both
+  STATUS   → STATUS:IN=ON,SE=OFF   (or ON/OFF for each)
+  unknown  → ERR:UNKNOWN_CMD
+
+STATE TRACKING: driver tracks _in_open, _se_open locally
+PROPERTIES:     shutter.in_is_open, shutter.se_is_open (used by recipe_logger)
+
+================================================================================
+SECTION 4b: HARDWARE — EUROTHERM EPC3004 INDIUM SOURCE CONTROLLER
+================================================================================
+
+MANUFACTURER: Eurotherm (Schneider Electric)
+PURPOSE:      Single-loop PID temperature controller for the Indium evaporation source
+PROTOCOL:     Modbus RTU over RS-485
+BAUD:         19200, 8N1
+SLAVE ID:     1 (configurable)
+DEFAULT PORT: COM13 (configurable in Settings / DCFG)
+
+THERMOCOUPLE TYPE: Type C (W5%Re / W26%Re, ASTM E988), 0–2315°C
+  The EPC3004 does not natively support Type C.
+  SOLUTION: J-PROXY METHOD — EPC3004 configured as Type J TC; Python corrects PV/SP.
+  Status: CONFIRMED WORKING (2026-05-13)
+
+J-PROXY METHOD — HOW IT WORKS:
+  1. EPC3004 is configured: AI.1.Type=0 (Thermocouple), AI.1.Linearisation=0 (J).
+     One-time setup: run  python diagnostics/configure_epc3004_cstm1.py --port COM13 --set-j-mode
+  2. The Type C TC generates EMF V_C(T_true). The EPC3004 treats this as Type J EMF:
+       V_eff = V_C(T_true) + Δ_CJC   where Δ_CJC = V_J(25°C) − V_C(25°C) = +0.924 mV
+       T_J_display = J_inverse(V_eff)   → displayed in range ~18–679°C
+  3. Python converts in both directions via 16-point piecewise-linear tables:
+       j_display_to_c(t_j) → true Type C °C  (used when reading PV)
+       c_to_j_display(t_c) → J-apparent °C   (used when writing SP)
+  4. The EPC3004 instantiation in gui_app.py uses j_proxy=True:
+       EPC3004(port, id, baud, j_proxy=True)
+     With j_proxy=True, _raw_to_c() and _c_to_raw() apply the conversion transparently.
+     All external interfaces (GUI labels, recipe engine, safety checks) see true °C.
+
+J-PROXY CONVERSION TABLE (manuals/type_c_via_j_proxy.csv):
+  T_J_display (°C)  →  T_C_true (°C)   (Δ_CJC = +0.924 mV, T_cj = 25°C)
+    17.9              →    0.0
+    45.9              →  100.0
+    76.6              →  200.0
+   109.5              →  300.0
+   143.6              →  400.0
+   213.6              →  600.0
+   283.6              →  800.0
+   351.7              → 1000.0
+   416.3              → 1200.0
+   476.4              → 1400.0
+   531.4              → 1600.0
+   581.1              → 1800.0
+   625.1              → 2000.0
+   645.0              → 2100.0
+   663.0              → 2200.0
+   679.1              → 2300.0
+  J display range 17.9–679.1°C is well within Type J rated range (0–760°C).
+
+J-PROXY CONFIRMED REGISTER ADDRESSES (from iTools addys.csv, 2026-05-12):
+  AI.1.Type          frame 0x3002  (iTools Comms 0x00033002 → low 16 bits)
+    enum: 0=Thermocouple, 1=mV, 2=V, 3=mA, 4=RTD, 5=Zirconia
+    J-proxy mode: write 0 (Thermocouple)
+  AI.1.Linearisation frame 0x078E  (iTools Comms 0x0003078E → low 16 bits)
+    enum: 0=J, 1=K, 2=L, 3=R, 4=B, 5=N, 6=T, 7=S, 8=Custom1, 9=Custom2…
+    J-proxy mode: write 0 (J)
+  NOTE: Custom1 (LIN16/CSTM1) breakpoint registers were NOT found in the iTools
+    address-space export — they are hidden until Custom1 is activated in iTools.
+    The J-proxy approach was chosen because it requires only the two confirmed registers.
+
+CHANNEL ASSIGNMENT:
+  CH1 = Indium evaporation source (single channel device — only CH1 exists)
+
+TEMPERATURE ENCODING:
+  RESOLUTION_FACTOR = 10 (confirmed by diagnostic 2026-05-11)
+  Device display is configured for 0.1°C resolution (one decimal place).
+  raw → °C (device scale):  raw / 10.0   (e.g. raw 2000 = 200.0°C in J-scale)
+  With j_proxy=True: _raw_to_c() further applies j_display_to_c() → true Type C °C
+  With j_proxy=True: _c_to_raw() applies c_to_j_display() before ×10 encode
+  All PV/SP registers are INT16 (signed).
+
+KEY MODBUS REGISTERS (confirmed by epc3004_diag.py, 2026-05-11):
+
+  Frame addr  iTools#  Type   R/W  Description
+  ──────────────────────────────────────────────────────────────────────────────
+  0x0001      1        INT16  R    R_PV: Process Variable (current temp, °C×10)
+  0x0002      2        INT16  R    R_SP_RO: Working Setpoint — READ-ONLY
+                                   Tracks target SP through the ramp limiter.
+                                   Write returns Modbus exception code 2.
+                                   Used for live display in poll_all() (in_sp key).
+  0x0004      4        INT16  R    R_OP: Working Output Power (raw ÷ 10 = %)
+                                   Confirmed ~375 = 37.5% at 200°C.
+  0x0005      5        INT16  R    R_WSP: Working Setpoint (same as R_SP_RO)
+  0x0018      24       INT16  R/W  R_SP: Target Setpoint 1 — WRITABLE
+                                   Write here to command a new SP; device ramps
+                                   R_SP_RO toward R_SP at the configured rate.
+                                   Confirmed writable by write+readback test.
+  0x0020      32       INT16  R/W  R_SP_RATE: SP Ramp Rate (stored as rate × 10)
+                                   Confirmed readable: raw 1000 = 100.0°C/min.
+                                   Write access not yet confirmed (test with iTools).
+  0x0021      33       INT16  R/W  R_SP_RATE_U: SP Rate Unit
+                                   0=off (instant), 1=°C/s, 2=°C/min, 3=°C/h
+                                   Confirmed readable: 0 = ramp currently disabled.
+  0x0111      273      UINT16 R    R_STATUS: Instrument Status word
+                                   bit 0 = Summary alarm; bit 3 = sensor break
+                                   bit 8 = Manual mode (0=Auto, 1=Manual)
+                                   Confirmed readable: 0x0000 = Auto, no alarms.
+  0x0112      274      UINT16 R/W  R_AUTO_MAN: Auto/Manual switch
+                                   0 = Auto (PID running), 1 = Manual (output off)
+                                   Confirmed readable; write not yet confirmed.
+
+  REGISTER ADDRESSES THAT DO NOT WORK (confirmed by diagnostic):
+  0x0002 is READ-ONLY despite being listed as R/W in some reference docs.
+  0x0023 / 0x0024 (old driver guess for ramp regs) return 0x8000 sentinel —
+    not applicable on this firmware. Correct addresses are 0x0020 / 0x0021.
+
+DRIVER API (devices/epc3004.py):
+  EPC3004(port, slave_id=1, baudrate=19200, j_proxy=False)
+    j_proxy=True: enables Type C J-proxy conversion in _raw_to_c() / _c_to_raw().
+    gui_app.py instantiates with j_proxy=True (as of 2026-05-13).
+
+  Module-level conversion functions (also importable):
+    j_display_to_c(t_j)  → float   J-apparent °C → true Type C °C
+    c_to_j_display(t_c)  → float   true Type C °C → J-apparent °C (for SP writes)
+
+  connect()                          → bool (raises ConnectionError on failure)
+  disconnect()                       → None
+  connected: bool                    class attr, True after connect()
+  j_proxy: bool                      True = J-proxy mode active (Type C via Type J)
+  poll_all()                         → {"in_pv": float, "in_sp": float,
+                                         "in_op": bool, "in_out": float}
+                                       in_pv/in_sp are in TRUE TYPE C °C when j_proxy=True.
+  apply_setpoint(ch, celsius)        → {"ok": bool, "readback": float, "message": str}
+                                       celsius is TRUE TYPE C °C when j_proxy=True.
+                                       Writes to R_SP (0x0018); reads back from same.
+  go_operate(ch=1)                   → {"ok": bool, "message": str}
+  go_standby(ch=1)                   → {"ok": bool, "message": str}
+  read_ramp_rate(ch)                 → float (°C/min); reads R_SP_RATE 0x0020
+  write_ramp_rate(ch, rate_per_min)  → bool; writes R_SP_RATE 0x0020 + R_SP_RATE_U 0x0021
+  ch1_read_process_value()           → Optional[float]   (true Type C °C when j_proxy=True)
+  ch1_read_setpoint()                → Optional[float]   (true Type C °C when j_proxy=True)
+  ch1_read_output_pct()              → Optional[float]   (reads R_OP 0x0004, raw÷10=%)
+  ch1_is_operating()                 → bool              (reads R_STATUS 0x0111 bit 8)
+  debug_callback: callable(str)|None  (set by GUI for TX/RX hex logging)
+
+SNAP DICT KEYS (written by Poller._loop after each poll_all()):
+  in_pv:  float|None   current temperature (°C)
+  in_sp:  float|None   setpoint (°C)
+  in_op:  bool|None    True = OPERATING, False = STANDBY
+  in_out: float|None   PID output %
+
+SIMULATION (EPC3004Sim in sim_devices.py):
+  Reuses existing _ChannelSim (same P-only thermal model as HEAT3Sim channels).
+  connected = True (class attr)
+  debug_callback = None (class attr)
+  poll_all() → {"in_pv": ..., "in_sp": ..., "in_op": ..., "in_out": ...}
+  All apply_setpoint / go_operate / go_standby / ramp methods match real driver API.
+  Background 1Hz tick drives the _ChannelSim thermal model.
+
+================================================================================
+SECTION 5: SOFTWARE — GUI APPLICATION (gui_app.py)
+================================================================================
+
+CLASS: MainWindow(QMainWindow)
+
+DEVICE REFERENCES (set by _resolve()):
+  self.brax    = BRAX3400    | BRAX3400Sim    | None
+  self.heat3   = HEAT3       | HEAT3Sim       | None
+  self.shutter = ArduinoShutter | ArduinoShutterSim | None
+  self.indium  = EPC3004     | EPC3004Sim     | None   ← Indium source controller
+
+KEY DESIGN PATTERNS:
+
+1. SINGLE SERIAL READ PATH (critical — eliminates port contention):
+   Poller thread → reads all hardware → Snap.write(**d) AND logger.feed(ig, ch1, ch2)
+   DataLogger has NO internal poll thread; it is purely a buffer + CSV writer.
+   logger.feed() is the ONLY way data enters the plot buffers during live logging.
+   During recipe runs, _sync_rec_log() pushes rec_log rows into the same buffers.
+
+2. HARDWARE SNAPSHOT (no serial I/O on main thread):
+   Poller thread (0.25s default) → reads hardware → Snap.write(**d)
+   self._vt QTimer (100ms)       → Snap.read() → updates value labels
+   Snap is a thread-safe dict (Lock-guarded)
+
+3. PLOT PIPELINE:
+   Poller._loop() → logger.feed()       → pressure_buf / ch1_temp_buf / ch2_temp_buf / in_temp_buf
+   PlotWorker QThread (100ms tick)       → reads buffers, filters to rolling window,
+                                           builds numpy arrays, emits data_ready signal
+   MainWindow._on_plot_data(d) slot      → setData() on pyqtgraph PlotDataItems (tc1/tc2/tc3)
+                                           + setXRange(x_min, x_max) for rolling window
+   Temperature curves: tc1=Se(OR), tc2=Sub(PU), tc3=In(IN_C cyan)
+
+   Buffer timestamps: absolute Unix float (time.time()) — DateAxisItem shows wall clock.
+
+   PlotWorker.window_s: rolling window length in seconds; set by _set_plot_window().
+   Window options: 60 / 600 / 1800 / 3600 s (buttons in plot tab, default 600).
+
+   CRITICAL — x-range must advance every tick:
+   PlotWorker._tick() always computes x_min/x_max BEFORE the data-change early-return.
+   If no new data: emits {'x_min': cutoff, 'x_max': now} only (no arrays).
+   If new data:    emits full dict with arrays + x_min/x_max.
+   This ensures setXRange is called every 100ms even with no new data, so the rolling
+   window advances continuously. Without this, the view froze and new data appeared
+   off-screen to the right, then "rolled in" as the window eventually caught up.
+
+4. POLLER BATCHING:
+   if hasattr(heat3, 'poll_all'):     # real HEAT3 → 3 batch Modbus reads
+       d.update(heat3.poll_all())
+   else:                              # HEAT3Sim → 8 individual attribute reads
+       individual reads per channel
+   if hasattr(epc, 'poll_all'):       # EPC3004 → poll_all() → in_pv/sp/op/out
+       d.update(epc.poll_all())
+   else:
+       individual reads: in_pv, in_sp, in_out, in_op
+   After reads: self.snap.write(**d) AND if self.logger: self.logger.feed(ig, ch1_pv, ch2_pv, in_pv)
+
+5. PLOT SYNC DURING RECIPE RUNS:
+   _sync_rec_log() QTimer (100ms) reads NEW rows from rec_log._rows_pressure/temp.
+   Uses _sync_p_idx / _sync_t_idx (MainWindow attrs) to track last synced position.
+   Only rows[idx:] are appended — each row is pushed to logger buffers exactly once.
+   Indices reset to 0 at run start (_r_run) and when rec_log.running is False.
+   Converts elapsed time to absolute timestamp: base = now - last_elapsed (of entire list)
+   Appends (base + elapsed, value) tuples to logger buffers.
+   PlotWorker picks up the new tail on its next 100ms tick.
+
+   CRITICAL — do NOT re-append all rows on every tick:
+   Old code used rows[-20:] on every call → same row appended ~10× per second at 1Hz
+   rec_log rate → 10× duplicate points on the plot (visually: thick stacked traces).
+   Fix: index-tracked append (rows[_sync_p_idx:]) ensures one append per new row.
+
+6. TEST MODE:
+   self._test = True → _resolve() assigns Sim devices, auto-starts logger
+   Toggle: 🧪 Test: OFF / ON button (self.tb, toolbar)
+
+7. DEBUG MODE:
+   self._debug = True → heat3.debug_callback = lambda m: QTimer.singleShot(0, ...)
+   Shows raw TX/RX hex in System Log
+
+8. RUN FLOW:
+   ▶ Run clicked → _r_run()
+     - _resolve() called first (ensures recipe.heat3/brax/shutter are current)
+     - logs "▶ Run: heat3=<ClassName>  test=ON/OFF" — always visible for diagnostics
+     - if recipe STATE_PAUSED: call recipe.resume(), return
+     - prompt QInputDialog for sample name
+     - if live CSV logger running: pause it (self._log_was_running = True)
+     - rec_log.start(sample_name)
+     - recipe.start()
+   Recipe STATE→DONE/ERROR → _r_state(s)
+     - rec_log.stop()
+     - export_excel(_LOG_DIR) in daemon thread, log result path
+     - if _log_was_running: restart CSV logger
+
+9. STEP INDICATOR AND ROW HIGHLIGHTING:
+   _RecipeBridge(QObject): pyqtSignal bridge for cross-thread GUI updates.
+     step_change(int), status_msg(str), state_change(str)
+     recipe callbacks emit signals → queued delivery to main thread (safe on Windows)
+   _r_step(i): deactivates previous row → activates new row → scrolls to it
+     Reads step_num (col 0), action (col 1), p1/p2 from table cells (no p3 col).
+     For GOTO: computes current_pass / total_execs from recipe._loop_counters[i].
+       Formula: total_execs = loops + 1; current_pass = total_loops - remaining + 1
+       Display: "GOTO N [2/10]" (current pass / total passes)
+     Updates rsk label: "Step N: ACTION param1 → param2"
+   _set_recipe_row_active(row, active):
+     Active background: #3d2e00 (dark amber); text: #f1fa8c (Dracula yellow); border: OR
+     Dual mechanism: selectRow/clearSelection for item cells + setStyleSheet for ComboBoxes
+     viewport().update() forces immediate repaint
+   Active row cleared on STATE_IDLE/DONE/ERROR.
+
+10. RECIPE TABLE DRAG-DROP REORDER:
+    RecipeTable(QTableWidget) subclass — dropEvent suppresses Qt built-in move
+    (which destroys cell widgets), emits row_moved(src, dst) signal instead.
+    _on_row_moved(src, dst): extracts steps list → reorders → renumbers → rebuilds.
+    Vertical header (18px wide) acts as drag handle; DragDropMode=InternalMove.
+
+11. COLLAPSIBLE COLUMN GUIDE:
+    Small toggle button "▶ Column Guide" / "▼ Column Guide" above recipe table.
+    Expands a QFrame with an HTML table explaining all 5 recipe columns.
+    State: self._help_visible (bool), toggled by _toggle_help closure.
+
+12. RECIPE PREVIEW PLOT (bottom of recipe tab, below the table):
+    pyqtgraph PlotWidget — live estimated-timeline visualization, rebuilt on every edit.
+    X-axis: estimated time in seconds. Y-axis: temperature °C.
+    Traces:
+      Orange line  = Se (CH1) temperature trajectory
+      Purple line  = Sub (CH2) temperature trajectory
+    Overlays (dynamically added/removed via self._rp_items list):
+      Shutter backgrounds: In open → bright green (#22ee44, alpha 50)
+                           Se open → orange-red (#ee6622, alpha 50)
+                           Both    → green (#22cc55, alpha 50)
+      WAIT_TEMP / WAIT_PRESSURE regions: gray dotted-border band (UNKNOWN_DT=120s placeholder)
+      GOTO loop regions: white dashed border, centered "?×N" label (N = total executions)
+      RAMP_TEMP events: vertical dashed line in channel color + rate label at top
+    Simulation (_simulate_recipe_timeline, @staticmethod):
+      Tracks se_rate/sub_rate (°C/min) — updated by RAMP_TEMP steps (default 4/100 °C/min).
+      SET_TEMP: dt = |target - current| / rate * 60 s (proportional to rate and distance).
+      WAIT_TIME: dt = param1 seconds.
+      WAIT_TEMP/WAIT_PRESSURE: dt = 120s (fixed, shown with gray region).
+      OPEN/CLOSE_SHUTTER: updates shutter state tracking (no time advance).
+      GOTO: adds dashed-box region from target step time to current time; no unrolling.
+    Debounce timer (self._rp_timer, 400ms single-shot):
+      Started by rtab.itemChanged, action combobox changes, param1 combobox changes.
+      Fires _refresh_recipe_preview() which clears and redraws all dynamic items.
+    Plot items: self._rp_se, self._rp_sub (permanent curves); self._rp_items (dynamic, cleared each refresh).
+
+SAFETY STATE (MainWindow.__init__):
+  self.safety          = dict of per-channel limits and standby settings (see Section 16)
+  self._safety_warn_t  = {}     keyed per channel/type → last warning time (time.monotonic)
+  self._safety_tripped = set()  channels currently auto-tripped (cleared on E-STOP reset or PV recovery)
+  self._safety_latch   = None   None | "estop"  — only E-STOP latches; STANDBY does not
+
+TOP-BAR SAFETY BUTTONS (self.standby_btn, self.estop_btn):
+  Centered between title and right-side controls in _topbar().
+  See Section 16 for full behavior.
+
+TIMERS:
+  self._vt    100ms → _vals()              (reads Snap, updates labels)
+  self._pt    100ms → _sync_rec_log()      (copies rec_log rows into plot buffers)
+  self._rp_timer 400ms single-shot → _refresh_recipe_preview()  (recipe edit debounce)
+  PlotWorker  100ms tick                   (builds numpy, emits data_ready signal)
+  Poller      0.25s default interval (configurable in Settings, range 0.10–30 s)
+  rec_log     1Hz bg thread (independent serial reads during recipe run)
+
+POLLER FAST PATH:
+  Real HEAT3: poll_all() → 3 batch FC 0x03 reads (~35–50ms total for HEAT3)
+  BRAX:       read_until(b'\r') → ~21ms
+  Total cycle: ~55–70ms → headroom at 0.25s interval is ~180ms
+  With 0.25s interval → 4 Hz data refresh (labels at 10 Hz, plot at ~4 Hz)
+
+LOG WIDGET:
+  self.log_w = QTextEdit(readOnly=True)
+  self.log_w.document().setMaximumBlockCount(800)
+  self.log_w.append(html_string)  ← uses append (not appendHtml)
+  auto-scrolls to bottom after each message
+
+OUTPUT FILES:
+  _LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")  (auto-created)
+  logs/pressure_log_YYYYMMDD_HHMMSS.csv     live log (DataLogger)
+  logs/YYYYMMDD_HHMMSS_samplename.xlsx      run log  (RecipeLogger)
+
+ACTION_CH_OPTS — actions that get a channel dropdown for Param1:
+  SET_TEMP, RAMP_TEMP, WAIT_TEMP, HEATER_ON, HEATER_OFF
+    → ["Selenium (CH1)", "Substrate (CH2)", "Indium (EPC)"]
+
+ACTION_SHUTTER_OPTS — actions that get a source dropdown for Param1:
+  OPEN_SHUTTER, CLOSE_SHUTTER → ["In", "Se", "Both"]
+
+ALL_ACTIONS (current):
+  SET_TEMP, RAMP_TEMP, WAIT_TEMP, WAIT_PRESSURE, WAIT_TIME,
+  OPEN_SHUTTER, CLOSE_SHUTTER,
+  IG_ON, IG_OFF, HEATER_ON, HEATER_OFF, GOTO, END
+
+RECIPE TABLE — 5 columns (Step | Action | Param1 | Param2 | Notes):
+  Col 0: Step number (int, 1-based)
+  Col 1: Action (QComboBox, ALL_ACTIONS list)
+  Col 2: Param1 — QComboBox for channel/source actions, else text
+  Col 3: Param2 — target °C / rate °C/min / tolerance / loop count / pressure (text)
+  Col 4: Notes (text, stretch)
+  NOTE: Rate column (formerly Col 4) was removed 2026-05-09. RAMP_TEMP rate now in Param2.
+        Old 6-col Excel files load correctly (param3 read but ignored by engine).
+
+  Excel save format: Step|Action|Param1|Param2|Notes  (5 cols)
+  Old 6-col files load correctly via load_excel() 5/6-col auto-detect in recipe_engine.py.
+
+_rtab_to_steps() TYPE RULES:
+  p1s, p2s = raw strings from table cells
+  "None" string → treated as "" (guard against old saves)
+  p1: if contains alpha chars → keep as str; else → float or None
+  p2: float() or None; fall back to str if float fails
+  param3: always None (col 4 removed; old engines that need param3 pass None)
+
+INDIUM PANEL (EPC3004):
+  Group box: "EPC3004 — Indium Controller" with a single TempCh("Indium Source", IN_C).
+  Buttons wired to _operate_in(), _standby_in(), _apply_sp_in(), _apply_ramp_in().
+  Dev Ramp spinbox reads EPC3004 reg via read_ramp_rate(1) on connect and test-mode activate.
+  LED indicator "EPC3004" in topbar tracks self._in.connected state.
+  COM port combobox (epc3004_port) in topbar and SettingsDlg.
+
+_operate_in() / _standby_in():
+  Calls indium.go_operate(1) / go_standby(1) in daemon thread. Logs response message.
+
+_apply_sp_in(val, msg_lbl):
+  Calls indium.apply_setpoint(1, val). Shows ✓/✗ in msg_lbl.
+
+_apply_ramp_in(rate, msg_lbl):
+  Calls indium.write_ramp_rate(1, rate). Shows ✓/✗ in msg_lbl.
+
+_safe_standby_in():
+  Daemon thread: go_standby(1) + write_ramp_rate(1, standby_ramp) +
+  apply_setpoint(1, standby_temp). Uses in_standby_* from self.safety dict.
+
+_conn_epc():
+  Instantiates EPC3004(port, id, baud, j_proxy=True), calls connect(), _resolve(), _read_device_ramp_rates().
+  j_proxy=True enables Type C ↔ J-proxy conversion in all PV/SP reads and writes.
+  Logged as "✓ EPC3004 on COMx". Accessible from Hardware menu or topbar "Connect All".
+
+TEMPC PANEL (class TempCh) — per-channel control (used for HEAT3 CH1/CH2 and EPC3004 Indium):
+  Rows: header (LED, state, name) | PV/SP boxes | Output % | divider
+        "New SP" spin + "Apply" button + status msg
+        "Dev Ramp" spin + "Set" button + status msg
+        OPERATE / STANDBY buttons
+
+  self.sp_spin   QDoubleSpinBox  0–1500 °C, applies SP instantly on "Apply"
+  self.ap_btn    QPushButton     calls _apply_sp(ch, val, ap_msg) — always instant
+  self.ap_msg    QLabel          shows ✓/✗ after SP write
+  self.rate_spin QDoubleSpinBox  0–1000 °C/min; 0 = "Off (instant)" (device internal rate)
+  self.rr_btn    QPushButton     calls _apply_ramp(ch, rate, rr_msg) — writes reg 43/44 or 101/102
+  self.rr_msg    QLabel          shows ✓/✗ after ramp rate write
+
+  set_safety_state(state: str):
+    "trip" → QFrame border 2px solid RD  (red, temp exceeded max)
+    "warn" → QFrame border 2px solid OR  (orange, approaching max)
+    "ok"   → QFrame border 1px solid self._ac  (normal channel accent color)
+    Called by _check_safety() every 100 ms and by _safety_reset_prompt() on E-STOP clear.
+
+_apply_sp(ch, val, msg_lbl):
+  Always writes SP immediately (heat3.apply_setpoint).
+  Device's own internal ramp rate (set via Dev Ramp / Set) governs how fast
+  the HEAT3 transitions to the new SP.
+
+_apply_ramp(ch, rate, msg_lbl):
+  Calls heat3.write_ramp_rate(ch, rate). Writes reg 43+44 (CH1) or 101+102 (CH2).
+  rate=0 → device jumps to SP instantly (reg written as 0).
+
+_read_device_ramp_rates():
+  Called after HEAT3 connect, EPC3004 connect, and after test mode activates.
+  Reads heat3.read_ramp_rate(1/2) and epc.read_ramp_rate(1) in background thread,
+  then updates ch1.rate_spin, ch2.rate_spin, ch_in.rate_spin via QTimer.singleShot.
+
+================================================================================
+SECTION 6: SOFTWARE — RECIPE ENGINE (recipe_engine.py)
+================================================================================
+
+CLASS: RecipeEngine
+STATES: IDLE → RUNNING → PAUSED → DONE / ERROR
+
+@dataclass RecipeStep:
+  step: int, action: str, param1: float|str|None, param2: float|None, param3: float|None, notes: str
+  param3: always None from GUI (Rate col removed 2026-05-09); load_excel() still parses old 6-col files
+          and populates param3 for backward compat, but no action currently uses it
+
+CONTROL API:
+  start()   clear _stop, _loop_counters; start _run thread
+  pause()   clear _pause Event → _wait() blocks
+  resume()  set _pause Event
+  stop()    set _stop + _pause; join thread 3s; state→IDLE
+  load_excel(path) → List[RecipeStep]
+
+_run() LOOP LOGIC:
+  idx = 0
+  while idx < len(steps):
+    if _stop: break
+    _pause.wait()
+    result = _exec(step, idx)
+    if result is None:  → STATE_ERROR, return
+    elif result == -1:  → idx = _goto_idx   (GOTO jump)
+    elif result == 2:   → break              (END clean exit)
+    else:               → idx += 1
+  if not _stop.is_set(): → STATE_DONE
+  (this ensures END→DONE and stop()→IDLE, never confused)
+
+_exec() RETURN VALUES:
+  1    normal advance
+  -1   GOTO jump (self._goto_idx set to target row index)
+  2    END clean exit
+  None error (caller sets STATE_ERROR)
+
+ACTION IMPLEMENTATIONS:
+
+SET_TEMP:
+  if _is_indium_src(p1) → self.indium.apply_setpoint(1, float(p2)); return 1 early
+  elif p1 is alpha str  → ch = _src_to_ch(p1), temp = float(p2)
+  else                  → ch = 1, temp = float(p1)   (legacy)
+  heat3.apply_setpoint(ch, temp)
+
+RAMP_TEMP:
+  p1 = channel (Selenium/Substrate/Indium), p2 = rate °C/min
+  if _is_indium_src(p1) → self.indium.write_ramp_rate(1, rate); return 1
+  else                  → heat3.write_ramp_rate(_src_to_ch(p1), rate)
+  Sets the device-internal ramp rate. Equivalent to "Dev Ramp → Set" in TempCh panel.
+  No software stepping, no target SP — use SET_TEMP afterward to move to new target.
+  Typical recipe pattern: RAMP_TEMP (set rate) → SET_TEMP (set target) → WAIT_TEMP (stabilize).
+  If device is None: logs warning and skips (return 1), no error.
+  BUG HISTORY (fixed 2026-05-09): Old RAMP_TEMP did software stepping (step SP every 5s
+    toward target). Replaced with device-internal ramp to avoid setpoint churning and
+    correctly match GUI behavior. Old 6-col recipes had (channel, target, rate) in
+    (p1, p2, p3); new behavior ignores old p3 and uses p2 as the rate.
+
+WAIT_TEMP:
+  p1 = channel name (e.g. "Selenium (CH1)", "Substrate (CH2)", "Indium (EPC)") OR legacy float
+  p2 = tolerance °C (default 2.5)
+  if _is_indium_src(p1) → reads PV from self.indium.ch1_read_process_value()
+  elif alpha string      → reads PV from heat3.ch{n}_read_process_value()
+  else (legacy float)   → reads PV from heat3.ch1_read_process_value()
+  Explicit device check at entry: if device is None, logs warning and skips (return 1).
+    This makes missing-device skip visible in the log rather than a silent 2s pass-through.
+  Logs initial state at entry: "WAIT_TEMP CH1(Se): SP=X°C  PV=Y°C  tol=±2.5°C  hold=15s"
+  Stability requirement: PV must reach SP first, then stay within ±tol for 15 continuous seconds.
+  Poll every 2s (time.monotonic() for stable_since — more robust than time.time()).
+  If |PV-SP| ≤ tol: start stable_since timer, log "reached X°C — holding for 15s…"
+  If PV drifts out of range: log "left range — stability reset", reset stable_since to None.
+  Progress update logged every 6s during the hold window.
+  Break (advance recipe) only when elapsed >= 15.0s and continuously in range.
+  _r_run() logs "▶ Run: heat3=<type>  test=ON/OFF" so device assignment is always visible.
+  NOTE: p1 now selects the channel — previously was hardcoded to CH1 (BUG FIXED)
+
+WAIT_PRESSURE:
+  poll every 2s: read brax.read_ion_gauge(), break if P ≤ float(p1)
+
+WAIT_TIME:
+  _wait(float(p1))  — respects pause/stop, sleeps in 0.25s increments
+
+OPEN_SHUTTER / CLOSE_SHUTTER:
+  p1 lower: "both" → both_open/close; "se" → se_open/close; else → in_open/close
+
+HEATER_ON:  if _is_indium_src(p1) → indium.go_operate(1)  else → heat3.go_operate(_src_to_ch(p1))
+HEATER_OFF: if _is_indium_src(p1) → indium.go_standby(1) else → heat3.go_standby(_src_to_ch(p1))
+
+GOTO:
+  target = int(p1)  loops = int(p2)
+  find target step index by step number
+  _loop_counters[idx] initialized to loops on first hit
+  if counter > 0: decrement, jump; if 0: del counter, fall through
+  NET: steps execute (loops+1) total times
+
+_src_to_ch(param) → int:
+  "se", "selen", "1" → 1
+  "sub", "substrate", "2" → 2
+  default → 1
+
+_is_indium_src(param) → bool:
+  True if "indium" or "epc" in str(param).lower()
+  SAFE: "Selenium" has no "indium"/"epc"; "Substrate" has no "indium"/"epc" → no false matches
+  Used to route Indium actions to self.indium (EPC3004) before _src_to_ch fallback
+
+================================================================================
+SECTION 7: SOFTWARE — RECIPE LOGGER (recipe_logger.py)
+================================================================================
+
+CLASS: RecipeLogger
+POLL RATE: 1Hz background thread during active run
+
+DATA COLLECTIONS (lists of tuples):
+  _rows_pressure:  (timestamp_str, elapsed_s, ig_torr)
+  _rows_temp:      (timestamp_str, elapsed_s, ch1_c, ch2_c, in_c)   ← 5-element, in_c added
+  _rows_shutter:   (timestamp_str, elapsed_s, in_open_01, se_open_01)
+
+API:
+  start(sample_name)  → starts bg thread, sets _start_time = time.time()
+  stop()              → sets _stop Event, joins thread
+  export_excel(dir)   → saves YYYYMMDD_HHMMSS_samplename.xlsx, returns path
+
+EXCEL EXPORT — 5 SHEETS:
+  Sheet "Run Info":       sample name, date, BEP data (incl. live In temp if EPC3004 used),
+                          recipe table, temp chart
+  Sheet "Pressure":       timestamped IG pressure + line chart
+  Sheet "Temperature":    CH1(Se) + CH2(Sub) + In_C temps + line chart (3 series)
+                          Headers: Timestamp | Elapsed(s) | CH1_Se_C | CH2_Sub_C | In_C
+  Sheet "Shutters":       In/Se open states (0/1) + line chart
+  Sheet "BEP Fast Trace": full baseline+open-window trace for In and Se, with summary
+                           stats (baseline, peak, BEP, open window times), Se/In ratio,
+                           two separate line charts (In trace, Se trace).
+                           Only present if bep_trace_in or bep_trace_se is not None.
+
+  rec_log.bep_trace_in / rec_log.bep_trace_se: BEPTrace objects assigned in _r_run().
+  Data table at row 10: "In: Time (s)" | "In: Pressure (Torr)" | gap | "Se: Time (s)" | ...
+  In chart at G10; Se chart at G30.
+
+CHART API (openpyxl 3.1+):
+  from openpyxl.chart.series_factory import SeriesFactory
+  series = SeriesFactory(ref, title_from_data=True)
+  where ref = Reference(ws, min_col=col, min_row=1, max_row=n+1)
+  *** DO NOT use Series(data, title_from_data=True) — TypeError in openpyxl 3.1 ***
+  *** DO NOT use Series(val=data) — expects NumDataSource not Reference ***
+
+PLOT SYNC FROM rec_log → data_logger buffers:
+  _sync_rec_log() in gui_app uses _sync_p_idx / _sync_t_idx counters
+  Only new rows (beyond last synced index) appended to deque buffers — exactly once each
+  Reset counters to 0 at run start (_r_run) and when rec_log.running becomes False
+  Temperature rows: row[2]=ch1, row[3]=ch2, row[4]=in_t (if len(row)>4)
+  in_t appended to logger.in_temp_buf for Indium temperature plot
+
+================================================================================
+SECTION 8: SOFTWARE — BEP MANAGER (bep_manager.py)
+================================================================================
+
+CLASS: BEPManager
+PURPOSE: Beam Equivalent Pressure measurement for flux calibration
+
+CONSTANTS:
+  OPEN_DURATION     = 2.0 s     (shutter open time)
+  FAST_INTERVAL     = 0.05 s    (20 Hz sampling)
+  BASELINE_DURATION = 8.0 s     (baseline averaging window)
+  SETTLE_TIME       = 30.0 s    (post-In wait before Se measurement)
+  TOP_FRACTION      = 0.5       (top 50% of open-window samples used for BEP mean)
+
+MEASUREMENT SEQUENCE:
+  Phase          Duration  Sampling  Action
+  ─────────────────────────────────────────────────────────────────
+  Baseline(In)   8s        20Hz      shutter closed, accumulate baseline samples
+  Open In        2s        20Hz      in_open(), accumulate in fast_buf + trace
+  Close In       —         —         in_close()
+  Settle         30s       —         wait for chamber to recover
+  Baseline(Se)   8s        20Hz      shutter closed, accumulate baseline samples
+  Open Se        2s        20Hz      se_open(), accumulate in fast_buf + trace
+  Close Se       —         —         se_close()
+  Compute        —         —         calculate BEP values and ratio
+
+BEP CALCULATION:
+  baseline = statistics.mean(all closed-shutter samples)
+  Sort open-window samples descending; take top TOP_FRACTION (top 50%).
+  peak     = statistics.mean(top 50% of open-window samples)
+  BEP      = max(0, peak - baseline)
+  RATIONALE: mean of the highest samples avoids transient spikes (from shutter
+  opening) while still capturing peak flux. The mean is more stable than max().
+  BUG HISTORY: Old code had pressures[top_n:] (selected bottom half — wrong index).
+               Fixed to pressures[:top_n] (first elements of descending sort = highest).
+
+class BEPTrace:
+  Full annotated timeline for one source measurement (In or Se).
+  Used by the fast trace plot in the GUI to show annotations.
+  Fields:
+    source:          "In" or "Se"
+    samples:         List[(t_rel_s, pressure_Torr)] — all samples from baseline start (t=0)
+    baseline_end_t:  t_rel when baseline phase ended
+    open_start_t:    t_rel when shutter opened
+    open_end_t:      t_rel when shutter closed
+    baseline_val:    mean of all baseline samples (Torr)
+    peak_val:        mean of top TOP_FRACTION open-window samples (Torr)
+    bep_val:         peak_val − baseline_val (Torr)
+    top_samples:     List[(t_rel, pressure)] — open-window samples in the top fraction
+
+class BEPRecord:
+  source, temp_c, baseline (mean_baseline), peak (mean_top_fraction), bep, timestamp
+
+CSV OUTPUT (bep_log.csv — appended each run):
+  Columns: Timestamp, Source, Temperature_C, Baseline_Torr, Peak_Torr, BEP_Torr
+
+TEMPERATURES:
+  Se temp: read from heat3.ch1_read_process_value() at time of Se measurement
+  In temp: live from indium.ch1_read_process_value() if EPC3004 connected; else
+           falls back to INDIUM_TEMP_C = 744.0°C (constant, for backward compat)
+  BEP tab label (bep_itl): shows "In: X.X°C (live)" when EPC3004 active, else "In: 744°C (fixed)"
+  BEPManager.indium attribute (set by _resolve): None | EPC3004 | EPC3004Sim
+
+ATTRIBUTES SET AFTER MEASUREMENT:
+  self.last_in_bep, self.last_se_bep, self.se_in_ratio
+  self.trace_in:  BEPTrace — full annotated In trace (baseline + open window)
+  self.trace_se:  BEPTrace — full annotated Se trace (baseline + open window)
+  self.fast_buf:  [(t_rel_to_open, pressure)] open-window samples only (backward compat)
+
+FAST TRACE PLOT (⚡ Fast Trace tab in BEP tab):
+  Both In (orange) and Se (purple) traces shown simultaneously on same time axis.
+  Each trace starts at t=0 (baseline start for that source).
+  Visual annotations per source:
+    · Continuous line:    all samples (baseline phase + open window)
+    · Shaded band:        open-window time region (LinearRegionItem, semi-transparent)
+    · White-outlined dots: top-fraction samples used in BEP mean (scatter overlay)
+    · Dashed horiz line:  baseline pressure level
+    · Solid horiz line:   baseline + BEP = accepted flux level
+  Plot items: _bft_in/_bft_se (lines), _bft_in_top/_bft_se_top (scatter),
+              _bft_in_bl/_bft_se_bl (baseline lines), _bft_in_bep/_bft_se_bep (BEP lines),
+              _bft_in_rgn/_bft_se_rgn (region items, added/removed dynamically).
+  Updated in gui_app._update_fast_trace() called from _bep_plots() → _bep_done().
+
+CALLBACKS:
+  self.on_status   = callable(str)   → logged in GUI
+  self.on_state    = callable(str)   → updates state label + enable/disable buttons
+  self.on_progress = callable(float) → 0..1, updates progress bar
+  self.on_complete = callable()      → called when full In+Se sequence completes
+
+================================================================================
+SECTION 9: SOFTWARE — DATA LOGGER (data_logger.py)
+================================================================================
+
+CLASS: DataLogger
+ARCHITECTURE: "fed" model — no internal poll thread. Data enters via feed().
+BUFFER SIZE:  20 000 points (~1.4 hr at 4 Hz; deque auto-evicts oldest)
+
+PLOT BUFFERS (deque of (unix_time_float, value) tuples):
+  self.pressure_buf:   Deque[Tuple[float, Optional[float]]]
+  self.ch1_temp_buf:   Deque[Tuple[float, Optional[float]]]
+  self.ch2_temp_buf:   Deque[Tuple[float, Optional[float]]]
+  self.in_temp_buf:    Deque[Tuple[float, Optional[float]]]   ← Indium EPC3004 temperature
+  self.temp_buf = self.ch1_temp_buf  (legacy alias)
+
+PRIMARY API:
+  feed(pressure, ch1_t, ch2_t, in_t=None)  ← called by Poller._loop after each hardware read
+    in_t: Indium temperature from EPC3004 (None if not connected)
+    - appends absolute (time.time(), value) tuples to all three buffers
+    - writes one CSV row if running (self._fh is open)
+    - calls on_data callback if set
+    - thread-safe via self._lock
+
+  start_logging(log_path=None)   opens logs/pressure_log_YYYYMMDD_HHMMSS.csv;
+                                  does NOT start any thread
+  stop_logging()                 flushes + closes CSV
+
+READ API:
+  get_pressure_history()  → (t_list, p_list)    t values are absolute Unix floats
+  get_temp_history()      → (t_list, ch1_list)
+  get_ch2_temp_history()  → (t_list, ch2_list)
+  get_in_temp_history()   → (t_list, in_list)   ← Indium temperature history
+  _buf_to_lists(buf)      → returns [p[0] for p in pts], [p[1] for p in pts]
+                            (absolute timestamps — callers use DateAxisItem)
+
+CSV FILE: logs/pressure_log_YYYYMMDD_HHMMSS.csv
+  Columns: Timestamp, IG_Pressure_Torr, CH1_Temp_C, CH2_Temp_C, In_Temp_C
+  Line-buffered (buffering=1), written in Poller thread context
+
+ATTRIBUTES:
+  self.log_file_path  = current CSV path or None
+  self.running        = bool (True when file is open)
+  self.brax, self.heat3 = kept for API compat; NOT used internally (no poll loop)
+  self._fh, self._writer = open file handle + csv.writer; guarded by self._lock
+
+================================================================================
+SECTION 10: SOFTWARE — SIMULATION DEVICES (sim_devices.py)
+================================================================================
+
+BRAX3400Sim:
+  connected = True (class attr)
+  _ig:  random-walk 1e-9 to 5e-5 Torr, multiplicative, σ=3%
+  _cg1/cg2/ai: random-walk 1e-4 to 1e3 Torr, σ=2%
+  read_ion_gauge() returns 1.1e3 if _ig_on=False (matches real device)
+  Full interface: connect(), disconnect(), read_ion_gauge(), read_cg1(),
+                  read_cg2(), read_analog_input(), ig_on(), ig_off(), ig_status()
+
+HEAT3Sim:
+  Two _ChannelSim instances: _ch1 (Se), _ch2 (Sub)
+  _ChannelSim: P-only thermal sim with τ=120s, max 5°C/s, ±0.05°C noise
+  Background thread ticks at 1Hz
+  connected = True (class attr)
+  debug_callback = None (class attr — GUI sets this, must exist)
+  FULL INTERFACE (must match real HEAT3 exactly):
+    apply_setpoint(ch: int, celsius: float) → {"ok": True, "readback": celsius, "message": str}
+    go_operate(ch: int)  → {"ok": True, "message": str}
+    go_standby(ch: int)  → {"ok": True, "message": str}
+    ch1_read_process_value() → float
+    ch1_read_setpoint()      → float
+    ch1_read_output_pct()    → float
+    ch1_is_operating()       → bool
+    ch2_read_process_value() → float
+    ch2_read_setpoint()      → float
+    ch2_read_output_pct()    → float
+    ch2_is_operating()       → bool
+    read_ramp_rate(ch: int)  → float (°C/min); factory defaults: CH1=4.0, CH2=100.0
+    write_ramp_rate(ch: int, rate_per_min: float) → bool
+    (NO poll_all() — Poller detects absence via hasattr and uses individual reads)
+
+ArduinoShutterSim:
+  connected = True
+  in_is_open, se_is_open: bool properties
+  in_open(), in_close(), se_open(), se_close(), both_open(), both_close() → True
+
+EPC3004Sim:
+  connected = True (class attr)
+  debug_callback = None (class attr)
+  Uses a single _ChannelSim instance (_ch) with the same thermal model as HEAT3Sim.
+  Background 1Hz tick drives the model.
+  poll_all() → {"in_pv": float, "in_sp": float, "in_op": bool, "in_out": float}
+  apply_setpoint(ch, celsius) → {"ok": True, "readback": celsius, "message": str}
+  go_operate(ch=1)  → {"ok": True, "message": "In SIM → OPERATE"}
+  go_standby(ch=1)  → {"ok": True, "message": "In SIM → STANDBY"}
+  read_ramp_rate(ch)            → float (default 4.0 °C/min)
+  write_ramp_rate(ch, rate)     → bool
+  ch1_read_process_value()      → float  (PV alias)
+  ch1_read_setpoint()           → float  (SP alias)
+  ch1_read_output_pct()         → float  (output% alias)
+  ch1_is_operating()            → bool   (op state alias)
+
+================================================================================
+SECTION 11: KNOWN BUGS FIXED (history for AI context)
+================================================================================
+
+BUG 1 — QTextEdit.setMaximumBlockCount doesn't exist on widget:
+  FIX: log_w.document().setMaximumBlockCount(1000)
+
+BUG 2 — openpyxl 3.1 Series() constructor:
+  OLD (broken): Series(data, title_from_data=True) — data lands in idx arg (expects int)
+  OLD (broken): Series(val=data) — expects NumDataSource not Reference
+  FIX: from openpyxl.chart.series_factory import SeriesFactory
+       series = SeriesFactory(ref, title_from_data=True)
+       ref must start at header row (min_row=1) for title_from_data to work
+
+BUG 3 — END action never reached DONE state:
+  OLD: END called self._stop.set() → _run loop condition checked _stop → skipped
+       DONE section → stuck in RUNNING forever
+  FIX: END returns 2 → _run breaks cleanly → falls through to STATE_DONE
+
+BUG 4 — None stored as string "None" in recipe table cells:
+  OLD: str(None) = "None" stored in QTableWidgetItem → read back as alpha string
+       → float("None") crash in recipe engine
+  FIX: store "" when value is None; guard in _rtab_to_steps: if p1s=="None": p1s=""
+
+BUG 5 — HEAT3Sim missing ch argument on go_operate/go_standby:
+  FIX: all sim methods accept ch: int parameter matching real HEAT3 signature
+
+BUG 6 — Plot buffer corruption during recipe run:
+  OLD: _plots() extended deques then replaced them with plain lists, breaking deque API
+  FIX: append (time, value) tuples to existing deque; use _sync_*_idx counters
+
+BUG 7 — Log messages never appearing from background threads:
+  OLD: QTimer.singleShot from bg thread — unreliable on Windows PyQt5
+  FIX: pyqtSignal bridge (_LogBridge); all bg code calls _post_log()
+
+BUG 8 — Poller 8× slower than needed on real hardware:
+  FIX: heat3.poll_all() batches CH1(22 regs) + CH2(14 regs) in 2 reads
+       Serial timeout 1.0s → 0.25s; plot timer 2000ms → 500ms
+
+BUG 9 — WAIT_TEMP always waited on CH1 regardless of recipe param:
+  FIX: p1=channel dropdown (Selenium/Substrate), p2=tolerance°C
+       _src_to_ch(p1) selects correct read methods
+
+BUG 19 — TempCh Apply/Set buttons overflowed outside panel border:
+  SYMPTOM: "New SP" Apply button and "Dev Ramp" Set button appeared offset in
+           the negative X direction, outside the left edge of the TempCh panel.
+  ROOT CAUSE: Two QHBoxLayouts each with setFixedWidth() on label+spinbox+button
+              exceeded the ~198px available panel width; layout could not shrink.
+  FIX: Replaced both HBoxLayouts with a single QGridLayout.
+       setColumnStretch(1, 1) on spinbox column → spinbox fills remaining space.
+       sp_spin and rate_spin use setMinimumWidth(55) instead of setFixedWidth.
+       Buttons remain setFixedWidth(46); label widths are auto (sizeHint).
+       This is mathematically guaranteed to fit regardless of panel width.
+
+BUG 20 — Recipe row highlighting never appeared (threading + CSS conflict):
+  SYMPTOM: Active recipe row showed no visual highlight in test mode or live.
+  ROOT CAUSE 1 (threading): recipe.on_step_change used QTimer.singleShot(0, fn)
+    from a plain Python threading.Thread (no Qt event loop). On Windows PyQt5 this
+    is unreliable — BUG 7 pattern. The _r_step callback was never actually called.
+  ROOT CAUSE 2 (CSS conflict): Even if the callback fired, QComboBox cell widgets
+    drawn on top of QTableWidgetItem cells occlude the ::item:selected CSS — the
+    Action and Param1 columns (most visible) stayed un-highlighted.
+  FIX:
+    Added _RecipeBridge(QObject) with pyqtSignal(int/str) for step_change,
+    status_msg, state_change. Signals are always queued to the receiving thread's
+    event loop regardless of emitting thread → guaranteed main-thread delivery.
+    Added _set_recipe_row_active(row, active): dual-mechanism highlighting —
+      · selectRow() / clearSelection() for QTableWidgetItem cells (CSS handles them)
+      · Direct setStyleSheet() on any QComboBox cell widget in the row
+      · viewport().update() forces immediate repaint
+    Active row: background #3d2e00 (dark amber), text #f1fa8c (Dracula yellow),
+                border OR (#ffb86c orange).
+    ::item:selected CSS also updated to amber/yellow.
+
+BUG 23 — Plot view froze: data appeared off-screen then "rolled into" frame:
+  SYMPTOM: On app start or after a gap in data, plot data appeared to the right of the
+           visible frame and gradually scrolled into view rather than appearing at the
+           right edge immediately.
+  ROOT CAUSE: PlotWorker._tick() had an early-return when data hadn't changed, placed
+              BEFORE the now/cutoff/setXRange computation. If no new data arrived for
+              several seconds, data_ready was never emitted, setXRange was never called,
+              and the pyqtgraph view stayed locked to a stale time range. When new data
+              finally appeared, it was at "now" but the view's x_max was still "old now",
+              so data was to the right of the visible area.
+  FIX: Compute x_min/x_max before the early-return check. On no-data ticks, emit a
+       minimal dict {'x_min': cutoff, 'x_max': now} so setXRange advances every 100ms.
+       Full arrays are only built and emitted when data actually changed.
+
+BUG 24 — Recipe run plotted each data point 10× (double/triple trace visual):
+  SYMPTOM: During a recipe run, plots showed multiple overlapping traces or thick lines
+           instead of clean single-pixel lines. Each real data point appeared stacked.
+  ROOT CAUSE: _sync_rec_log() ran every 100ms and re-appended rows_p[-20:] on every
+              call. With rec_log writing at 1Hz, the same row was appended ~10 times
+              before the next real row arrived. The DataLogger deque accumulated 10×
+              duplicate (timestamp, value) tuples for every real measurement.
+  FIX: Added _sync_p_idx / _sync_t_idx counters to MainWindow.__init__. Each call to
+       _sync_rec_log appends only rows[idx:] (new rows since last sync) and advances
+       the index. Indices reset to 0 at _r_run() start and when rec_log.running is False.
+
+BUG 22 — WAIT_TEMP silently skipped when HEAT3 device not assigned (root cause of "immediately skipping"):
+  SYMPTOM: WAIT_TEMP advanced to next step ~2 seconds after reaching the step, with no
+           apparent temperature check. Happened in both test mode and live mode.
+  ROOT CAUSE: When self.heat3 is None (device not assigned), the while loop's
+              `else: break` fired after one 2-second poll, silently advancing the step.
+              _r_run() also lacked any log confirming what heat3 was assigned to.
+  FIX 1: Explicit device check at the start of WAIT_TEMP (before entering the loop):
+          if not self.heat3: log warning "no HEAT3 device — skipping" and return 1.
+          This makes the skip visible in the log rather than silent.
+  FIX 2: Log initial SP/PV at WAIT_TEMP entry: "WAIT_TEMP CH1(Se): SP=X°C PV=Y°C …"
+  FIX 3: _r_run() now logs "▶ Run: heat3=<ClassName>  test=ON/OFF" so device assignment
+          is always visible at run start. heat3=None ⚠ flags the missing device.
+  FIX 4: Changed stable_since from time.time() to time.monotonic() for robustness.
+  FIX 5: Progress logs during hold window every 6s ("holding… Xs remaining").
+
+BUG 21 — Drag-drop reorder destroyed QComboBox cell widgets:
+  SYMPTOM: After dragging a recipe row, QComboBox dropdowns in Action/Param1
+           columns disappeared or lost their signal connections.
+  ROOT CAUSE: Qt's built-in InternalMove mode moves QTableWidgetItem objects but
+              silently discards cell widgets (setItemWidget is not part of the move).
+  FIX: Subclassed QTableWidget as RecipeTable; overrode dropEvent to:
+       · Suppress Qt's built-in move: event.setDropAction(Qt.IgnoreAction)
+       · Emit custom row_moved(src, dst) signal
+       MainWindow._on_row_moved(src, dst):
+       · Extracts all rows via _rtab_to_steps() (pure Python list)
+       · Reorders the list, renumbers step fields 1-based
+       · Rebuilds entire table via _rtab_populate() — recreates all cell widgets
+         and signal connections cleanly.
+       RecipeTable grabs from vertical header (slim 18px strip, acts as drag handle).
+
+BUG 10 — B-RAX response parser wrong offset:
+  OLD: response[4:] assumed "*01_value" (underscore at pos 3)
+  FIX: strip '*', skip 3 chars (2-char hex addr + space), float(rest)
+       reject responses starting with '?' or '!'
+
+BUG 11 — HEAT3 R_REMOTE (reg 1000) write silently ignored:
+  OLD: connect(), apply_setpoint(), go_operate(), go_standby() all wrote
+       _write_word(R_REMOTE=1000, 1) to "acquire MASTER".
+       Device ACKs the write but reg stays 0 — write is a no-op on this firmware.
+       The extra write added ~30-60ms latency per sequence with no benefit.
+  FIX: Removed all R_REMOTE writes from sequences.
+       Writes (SP, WMODE, OPERATE) work as long as Remote Enable is ON in
+       the device menu — no software MASTER claim required.
+       Confirmed by diagnostics/heat3_sp_direct.py (2026-05-06).
+
+BUG 12 — HEAT3 _transact() read(max(expected,8)) caused timeout on every 1-reg read:
+  OLD: resp = self._ser.read(max(expected, 8))
+       A 1-word FC 0x03 response is 7 bytes; max(7,8)=8 → read() waited for 8th
+       byte until 0.25s serial timeout expired on every call to ch1_read_output_pct,
+       ch1_is_operating, ch2_read_output_pct, ch2_is_operating.
+       Result: 4 of the 8 individual reads each cost 264ms instead of ~12ms.
+  FIX: resp = self._ser.read(expected)
+       All reads now complete in ~12ms; total 8-read cycle dropped from ~1100ms → ~120ms.
+
+BUG 13 — BRAX readline() always timed out (wrong line terminator):
+  OLD: raw = self._serial.readline()
+       readline() waits for \n, but BRAX responses end with \r (carriage return).
+       Every BRAX call timed out at 0.25s.
+  FIX: raw = self._serial.read_until(b'\r')
+       BRAX reads now complete in ~21ms instead of ~250ms.
+
+BUG 14 — BRAX on wrong COM port (COM9 assumed, COM11 actual):
+  Symptom: VER command returned 0 bytes from COM9.
+  FIX: Enumerated serial.tools.list_ports.comports() — found Prolific PL2303GT
+       adapter on COM11. Confirmed by re-running timing_diag.py against COM11.
+  Default port updated to COM11 in DCFG and Settings dialog (2026-05-09).
+
+BUG 25 — BEP calculation selected bottom half of open-window samples (wrong index):
+  SYMPTOM: Indium BEP reading ~1 order of magnitude higher than expected; BEP values
+           did not represent true flux level, making Se/In ratios unreliable.
+  ROOT CAUSE: In _measure_source(), open pressures were sorted descending then sliced:
+                top_half = pressures[max(1, len(pressures)//2):]
+              This selected elements from index len//2 onward — the LOWER half of the
+              descending-sorted array (i.e., the smallest values). Variable was named
+              "top_half" but actually held the bottom half of pressures.
+  FIX: Replaced with TOP_FRACTION constant (default 0.5) and correct slice:
+         top_n    = max(1, int(len(sorted_pressures) * TOP_FRACTION))
+         top_vals = sorted_pressures[:top_n]   # first top_n = highest values
+         peak     = statistics.mean(top_vals)
+       Also replaced max(open) rationale with mean-of-top rationale:
+       mean of top 50% is more stable than max() (avoids single-sample spikes)
+       while still representing true flux rather than mean-of-all (which is
+       depressed by the slow shutter-opening transient at the start of the window).
+
+BUG 27 — RAMP_TEMP recipe action churned HEAT3 setpoint rather than using device ramp:
+  SYMPTOM: RAMP_TEMP in a recipe caused the HEAT3 SP to jump repeatedly in small increments
+           every 5 seconds, conflicting with the device's own internal PID ramp. The pattern
+           was visible as a staircase SP trace rather than a smooth device-controlled ramp.
+           Also: the rate was in Param3 (col 4) which was easy to miss and confusing.
+  ROOT CAUSE: Old RAMP_TEMP computed software steps (deg_per_step = rate/60 * 5s) and called
+              apply_setpoint() repeatedly. This fought against the device's own ramp logic and
+              did not match what the GUI "Dev Ramp → Set" button does.
+  FIX: RAMP_TEMP now calls heat3.write_ramp_rate(ch, rate_degC_per_min) — one write to
+       device registers 43/44 (CH1) or 101/102 (CH2). No looping, no SP changes.
+       Rate is now in Param2 (not Param3). Typical recipe pattern:
+         RAMP_TEMP | Selenium | 4      ← set 4°C/min on device
+         SET_TEMP  | Selenium | 400    ← device ramps to 400°C at 4°C/min
+         WAIT_TEMP | Selenium | 2.5    ← wait for stability
+
+BUG 28 — Recipe table Rate column (col 4) made RAMP_TEMP rate easy to miss / confusing:
+  SYMPTOM: Users were unsure which column to fill for RAMP_TEMP rate. Col 4 "Rate °C/min"
+           was only used by one action (RAMP_TEMP) while all others left it blank.
+  FIX: Removed the dedicated Rate column. Recipe table reduced from 6→5 columns.
+       RAMP_TEMP rate now goes in Param2 (col 3), consistent with all other numeric params.
+       Old 6-column Excel files load correctly (load_excel auto-detects col count and
+       reads param3 from col 4 if present, but RAMP_TEMP engine ignores param3 now).
+       Column guide in recipe tab updated to show new 5-column layout.
+
+BUG 26 — Fast trace plot only showed open-window data for one source at a time:
+  SYMPTOM: Fast trace tab showed either In or Se data, never both simultaneously,
+           and showed only the 2s open-window samples (not the baseline phase).
+           No visual indication of which samples were used in the BEP calculation.
+  FIX: Added BEPTrace class to bep_manager.py — stores full timeline (baseline +
+       open window) with phase boundary timestamps and top-fraction sample annotation.
+       BEPManager stores self.trace_in and self.trace_se after each measurement.
+       _update_fast_trace() in gui_app draws both sources simultaneously with:
+         · Full pressure timeline (baseline + open window) as continuous line
+         · Semi-transparent LinearRegionItem marking the open-window interval
+         · Scatter overlay of top-fraction samples (white-outlined dots)
+         · Dashed horizontal line at baseline pressure level
+         · Solid horizontal line at baseline + BEP (accepted flux level)
+         · Legend identifying In (orange) vs Se (purple)
+
+BUG 29 — EPC3004 does not natively support Type C thermocouple:
+  SYMPTOM: EPC3004 has no Type C (W5%Re/W26%Re) option in its TC selector.
+           The Custom1/CSTM1/LIN16 linearization table registers were not accessible
+           via Modbus — they are hidden in the iTools address-space export until Custom1
+           is already activated on the device front panel (chicken-and-egg problem).
+  FIX: J-PROXY method — EPC3004 configured as Type J TC; Python converts PV/SP.
+    1. Run configure_epc3004_cstm1.py --set-j-mode (one-time; writes 2 registers).
+    2. Module-level j_display_to_c() / c_to_j_display() in devices/epc3004.py implement
+       the 16-point piecewise-linear conversion (ASTM E988 + NIST ITS-90 Type J, T_cj=25°C).
+    3. EPC3004 instantiated with j_proxy=True in gui_app.py _conn_epc().
+       _raw_to_c() / _c_to_raw() apply the conversion transparently — no changes
+       needed in recipe engine, safety system, BEP manager, or GUI labels.
+  CONFIRMED WORKING: 2026-05-13.
+  Source files: devices/epc3004.py, diagnostics/configure_epc3004_cstm1.py,
+                manuals/type_c_via_j_proxy.csv, manuals/type_c_lin16_v2.csv
+
+BUG 15 — DataLogger poll thread competing with Poller for serial port:
+  OLD: DataLogger._poll_loop ran at 1Hz, making its own independent serial reads
+       (brax.read_ion_gauge, heat3.ch1_read_process_value, ch2_read_process_value)
+       simultaneously with Poller. Two threads contested the same serial ports.
+       Plot buffers updated at 1Hz regardless of Poller rate.
+  FIX: DataLogger._poll_loop never started. Added DataLogger.feed(p, t1, t2) method.
+       Poller._loop calls logger.feed() after every cycle.
+       Single serial read path; plot rate matches Poller rate (default 4Hz at 0.25s).
+
+BUG 16 — Plot x-axis showed relative seconds (confusing, wrong after clear):
+  OLD: _buf_to_lists subtracted t[0] from all timestamps → x-axis was seconds since
+       first data point, reset to 0 on each logging session.
+  FIX: _buf_to_lists returns absolute Unix float timestamps.
+       PlotWidget created with axisItems={'bottom': pg.DateAxisItem()}.
+       X-axis now shows real wall-clock time (HH:MM:SS).
+       PlotWorker emits x_min/x_max; _on_plot_data calls setXRange to lock view.
+
+BUG 17 — Poller interval default 1.0s, cfg["poll_interval"] never applied:
+  OLD: self.poller = Poller(self.snap)  → always used Poller.__init__ default of 1.0s.
+       The Settings dialog showed 0.5s but the poller ran at 1.0s.
+  FIX: self.poller = Poller(self.snap, interval=self.cfg.get("poll_interval", 0.25))
+       _settings() also updates self.poller.interval live on OK.
+
+BUG 18 — Log files saved to CWD instead of logs/ folder:
+  OLD: DataLogger used f"pressure_log_{ts}.csv" (relative path → wherever python ran).
+       RecipeLogger used export_excel(".") → xlsx in CWD.
+  FIX: _LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+       DataLogger.start_logging creates logs/ and saves there.
+       Both export_excel() calls in gui_app.py use _LOG_DIR.
+
+================================================================================
+SECTION 12: COMMON PATTERNS AND CONVENTIONS
+================================================================================
+
+THREAD SAFETY RULES:
+  ✓ All serial I/O in background threads (Poller, RecipeLogger, RecipeEngine, BEP)
+  ✓ DataLogger.feed() is called from Poller thread; guarded by self._lock
+  ✓ Snap dict for thread→GUI data handoff (read by _vals on 100ms timer)
+  ✓ PlotWorker emits data_ready signal; slot _on_plot_data runs on main thread
+  ✓ _RecipeBridge pyqtSignals for recipe engine → GUI (step, status, state)
+      pyqtSignal emitted from any thread → always queued to receiver's event loop
+      DO NOT use QTimer.singleShot(0, fn) from plain Python threads — unreliable on
+      Windows PyQt5 (no Qt event loop on background threads). Use pyqtSignal instead.
+  ✗ Never call self._log() from bg thread directly
+  ✗ Never call Qt widget methods from bg thread (except emit() on signals)
+  ✗ DataLogger.feed() must NOT be called from main thread (it may block on _lock)
+
+DEVICE METHOD RETURN TYPES:
+  Single reads (ch1_read_process_value etc.): Optional[float] — None on error
+  Command sequences (apply_setpoint, go_operate, go_standby): {"ok": bool, "message": str}
+  Connection: bool — raises ConnectionError on failure
+
+RECIPE PARAM CONVENTIONS:
+  Param1 for SET_TEMP/RAMP_TEMP/WAIT_TEMP/HEATER_ON/OFF: string like "Selenium (CH1)"
+  Param1 for OPEN_SHUTTER/CLOSE_SHUTTER: "In", "Se", or "Both"
+  Param1 for WAIT_TIME: float (seconds)
+  Param1 for WAIT_PRESSURE: float (Torr target)
+  Param1 for GOTO: int (target step NUMBER, not index)
+  Param2 for GOTO: int (loop count — total executions = count+1)
+  Param2 for SET_TEMP: float (°C) when Param1 is channel name
+  Param2 for RAMP_TEMP: float (°C/min — device-internal ramp rate to set)
+  Param2 for WAIT_TEMP: float (tolerance °C, default 2.5)
+
+COLOR CONSTANTS IN GUI (dark theme):
+  BG="#1e1e2e", PBG="#2a2a3e", BDR="#44446a"
+  BL="#5e9cf3" (blue), GR="#50fa7b" (green), RD="#ff5555" (red)
+  OR="#ffb86c" (orange — Se CH1), PU="#bd93f9" (purple — Sub CH2)
+  FG="#cdd6f4", DIM="#6c7086", SIM_C="#ff9f1c"
+  IN_C="#8be9fd" (cyan — Indium EPC3004)
+
+CHANNEL COLORS:
+  Selenium (CH1) = OR  (orange, #ffb86c)
+  Substrate (CH2) = PU (purple, #bd93f9)
+  Indium (EPC3004) = IN_C (cyan, #8be9fd)
+
+OUTPUT FILES LOCATION: logs/ subfolder of vac_control/ (auto-created)
+  logs/pressure_log_YYYYMMDD_HHMMSS.csv     live log (DataLogger)
+  logs/YYYYMMDD_HHMMSS_samplename.xlsx      run log  (RecipeLogger)
+  recipes/bep_log.csv                        BEP history (appended, not in logs/)
+
+================================================================================
+SECTION 13: HARDWARE WIRING DEFAULTS (configurable in Settings)
+================================================================================
+
+  Device          Default COM   Baud    Protocol
+  ─────────────────────────────────────────────────────────────
+  HEAT3           COM12         19200   Modbus RTU, Slave 1  (was COM3/57600)
+  B-RAX 3400      COM11         19200   InstruTech RS-485 ASCII, Addr 01
+                  (Prolific PL2303GT USB-RS485 adapter confirmed on COM11)
+  Arduino Uno     COM7          9600    Serial ASCII + \n terminator
+  EPC3004         COM13         19200   Modbus RTU, Slave 1  (Indium source)
+  Poll interval   0.25 s default (configurable in Settings, range 0.10–30.00 s)
+
+  NOTE: COM ports hardcoded in DCFG dict and Settings dialog fallbacks (gui_app.py).
+  These are the actual lab port assignments as of 2026-05-09 (EPC3004 COM13 TBC).
+
+================================================================================
+SECTION 14: DIAGNOSTICS TOOLS (diagnostics/)
+================================================================================
+
+PYTHON EXECUTABLE (Windows, Anaconda):
+  C:\Users\fmammo3\AppData\Local\anaconda3\python.exe
+
+All diagnostic scripts run standalone (no GUI open — they need exclusive serial).
+Run from the vac_control/ root directory:
+  C:\Users\fmammo3\AppData\Local\anaconda3\python.exe diagnostics/<script>.py [args]
+
+timing_diag.py — POLL CYCLE TIMING BENCHMARK  (needs exclusive serial — close GUI first)
+  Usage:  python diagnostics/timing_diag.py [heat3_port] [brax_port] [baudrate]
+  Example: python diagnostics/timing_diag.py COM12 COM11 19200
+  Measures per-call timing for 8 individual HEAT3 reads vs poll_all() batch,
+  BRAX read timing, and projects effective data rates at various poll intervals.
+  Also performs raw BRAX VER command check and reports actual response bytes —
+  useful for discovering the correct COM port when BRAX does not respond.
+  Run this to verify performance improvements after driver changes.
+
+plot_diag.py — GUI PLOT PIPELINE DIAGNOSTIC  (no hardware needed — GUI can be open)
+  Usage:  python diagnostics/plot_diag.py [--duration N] [--inject-hz N]
+  Example: python diagnostics/plot_diag.py --duration 10 --inject-hz 4
+  Tests the full software path: buffer injection → PlotWorker → data_ready signal.
+  Sections:
+    1. DataLogger config audit (detects feed() architecture vs old poll-loop)
+    2. Buffer append throughput (~170 000 appends/s)
+    3. PlotWorker._tick() timing with/without new data (0.3ms / <0.01ms)
+    4. Live Qt event loop rate test (measures actual signal emission rate)
+    5. End-to-end latency: buffer write → data_ready (target: <260ms)
+    6. Root cause summary and fix recommendations
+  Run this to verify plot pipeline speed after any changes to PlotWorker or DataLogger.
+
+heat3_sp_direct.py — HEAT3 SETPOINT WRITE TEST (key diagnostic)
+  Usage:  python diagnostics/heat3_sp_direct.py [port] [baudrate] [slave_id] [target_c]
+  Example: python diagnostics/heat3_sp_direct.py COM12 19200 1 100
+  Writes SP directly via plain Modbus (no PREVAC V2, no MASTER claiming).
+  Confirms SP write works with Remote Enable ON.  Use this to verify
+  the device is responding correctly before running the full app.
+
+heat3_diag.py — HEAT3 CH2 SETPOINT INVESTIGATION v4
+  Usage:  python diagnostics/heat3_diag.py [port] [baudrate] [slave_id] [target_c]
+  Probes CH2 SP write/readback to diagnose SP clamping or limit issues.
+  Tests FC 0x10 and FC 0x06 write paths; reads sensor config and status blocks.
+
+heat3_remote_test.py — PREVAC V2 REMOTE PROTOCOL DIAGNOSTIC
+  Investigates HEAT3 remote-enable using the PREVAC V2 host-registration
+  protocol (Host Register 0x7FF0 → MASTER claim 0x7FF1).
+  NOTE: This device does not respond to PREVAC V2 — use heat3_sp_direct.py instead.
+
+heat3_remote_watchdog.py — HEAT3 REMOTE WATCHDOG SIMULATOR
+  Simulates the full app startup/control sequence step-by-step, checking
+  whether the device stays in REMOTE MASTER mode after each command.
+  NOTE: Sends PREVAC V2 frames first which confuse the device; use
+  heat3_sp_direct.py for direct SP write testing.
+
+configure_epc3004_cstm1.py — EPC3004 TYPE C TC SETUP (J-PROXY METHOD)
+  One-time setup tool for the Type C thermocouple J-proxy configuration.
+  Confirmed working 2026-05-13.
+  Usage:
+    --check-regs   Read and display current AI.1.Type and AI.1.Linearisation registers.
+    --set-j-mode   Write AI.1.Type=0 (Thermocouple) + AI.1.Linearisation=0 (J) to EPC3004.
+                   This activates J-proxy mode; must be run once after any device reset.
+    --dryrun       Print the full J-proxy conversion table (no serial needed).
+    --test-live    Read PV in a loop and show J-apparent + converted Type C temperature.
+  Example: python diagnostics/configure_epc3004_cstm1.py --port COM13 --set-j-mode
+  Key register addresses (confirmed from iTools addys.csv):
+    AI.1.Type          0x3002  write 0 = Thermocouple
+    AI.1.Linearisation 0x078E  write 0 = J
+
+================================================================================
+SECTION 15: HOW TO ADD A NEW RECIPE ACTION
+================================================================================
+
+1. Add to ALL_ACTIONS list in gui_app.py
+2. If it needs a channel dropdown: add to ACTION_CH_OPTS
+3. If it needs a source dropdown: add to ACTION_SHUTTER_OPTS
+4. Add elif branch in RecipeEngine._exec() returning 1 (or 2/None/-1)
+5. Update _simulate_recipe_timeline() in gui_app.py for recipe preview plot behaviour
+6. Add to Section 6 (ACTION IMPLEMENTATIONS) of this CONTEXT.txt
+7. Test headlessly: python test_recipe.py (mock serial, mock modbus)
+
+================================================================================
+SECTION 15: PERFORMANCE TUNING
+================================================================================
+
+TARGET: 4 Hz data visible in GUI plots and labels.
+
+BOTTLENECKS IDENTIFIED AND FIXED (May 2026):
+
+  Round 1 — Hardware serial fixes:
+  1. HEAT3 _transact() sleep: 40ms → 10ms      (×8 reads saves ~240ms/cycle)
+  2. HEAT3 serial timeout: 1.0s → 0.25s        (miss costs 0.25s not 1.0s)
+  3. HEAT3 read(max(expected,8)) → read(expected)  (7-byte response no longer
+                                                  waits 250ms for phantom 8th byte)
+  4. HEAT3 poll_all() added: 8 reads → 3        (~4× fewer round-trips)
+  5. Poller uses poll_all() when available       (HEAT3Sim uses individual reads)
+  6. BRAX readline() → read_until(b'\r')        (21ms instead of 250ms per read)
+  7. BRAX command sleep: 60ms → 20ms            (saves 40ms per read cycle)
+  8. BRAX serial timeout: 1.0s → 0.25s
+
+  Round 2 — Software pipeline fixes:
+  9.  DataLogger poll thread eliminated; Poller.feed() is single read path
+      → removes serial port contention; plot rate = Poller rate
+  10. Default poll interval: 1.0s → 0.25s      (min 0.10s in Settings)
+  11. Poller.interval now correctly applied at startup (was always 1.0s)
+  12. PlotWorker QThread sleep: 250ms → 100ms  (detects new data faster)
+  13. Labels timer: 150ms → 100ms              (10 Hz label refresh)
+  14. rec_log sync timer: 200ms → 100ms
+  15. Rolling window filter in PlotWorker      (setData only over visible range)
+  16. Absolute timestamps + DateAxisItem       (correct wall-clock x-axis)
+
+ACHIEVED RATES (with HEAT3 on COM12 + BRAX on COM11, 19200 baud):
+  Hardware read time: ~55–70ms per poller cycle (poll_all + BRAX read_until)
+  At 0.25s interval  → ~4 Hz data refresh
+  Labels             → 10 Hz (100ms timer reading Snap)
+  Plot               → ~4 Hz (PlotWorker emits on each new Poller cycle)
+  Buffer→plot latency: ~50ms (PlotWorker 100ms tick)
+
+REMAINING HEADROOM:
+  At 19200 baud, a 9-byte Modbus read takes ~4ms at hardware level.
+  The 10ms inter-transaction sleep is the dominant cost per HEAT3 register.
+  Reducing to 0.15s poll interval is feasible if hardware stays stable.
+  Below 0.1s risks serial collisions — not recommended.
+
+================================================================================
+SECTION 16: SAFETY SYSTEM (gui_app.py)
+================================================================================
+
+OVERVIEW:
+  Two safety layers: (1) operator buttons in the top bar for immediate manual action,
+  (2) automatic limit monitoring every 100 ms in the background.
+
+─── TOP-BAR BUTTONS ──────────────────────────────────────────────────────────
+
+STANDBY BUTTON (yellow, ⏸ STANDBY):
+  Style: gold background (#b8860b), #ffd700 border
+  Behavior: SOFT PRESET — no latch, no reset required.
+  Action (fire-and-forget, runs in daemon thread):
+    1. shutter.both_close()
+    2. CH1 (Se): heat3.write_ramp_rate(1, 4.0) + heat3.apply_setpoint(1, 50.0)
+       → stays OPERATING, ramps down gracefully to 50°C at 4°C/min
+    3. CH2 (Sub): heat3.go_standby(2) + heat3.write_ramp_rate(2, 100.0)
+       → enters STANDBY state, ramp set for next operation
+    4. Indium (EPC3004): epc.write_ramp_rate(1, 15.0) + epc.apply_setpoint(1, 200.0)
+       → stays OPERATING, ramps to 200°C hold (above solidification ~157°C)
+  Button disables during execution, re-enables when done (QTimer.singleShot).
+
+E-STOP BUTTON (red, 🛑 E-STOP):
+  Style: RD background, #ff8888 border
+  Behavior: HARD STOP — latches on first click; second click opens reset dialog.
+  Latch state: self._safety_latch = None | "estop"
+  First click:
+    1. self._safety_latch = "estop"
+    2. _update_safety_btn_states() → E-STOP becomes "↺ CLICK TO RESET" (orange),
+       STANDBY button disabled
+    3. Daemon thread: both_close() + for CH1/CH2: go_standby(ch) + write_ramp_rate(ch, 0.0)
+       + apply_setpoint(ch, 0.0);  for Indium: go_standby(1) + write_ramp_rate(1, 0.0)
+       + apply_setpoint(1, 0.0)
+  Second click: _safety_reset_prompt() — QMessageBox.question:
+    "Clear Emergency Stop... Heaters remain in Standby until manually operated."
+    Yes → _safety_latch = None, _safety_tripped.clear(), ch1/ch2/ch_in borders reset,
+          _update_safety_btn_states() restores normal state, log green ✓ message
+    No  → latch stays active
+
+  _update_safety_btn_states():
+    if _safety_latch == "estop":
+      E-STOP → "↺ CLICK TO RESET" (orange/latch style), enabled=True
+      STANDBY → disabled
+    else:
+      E-STOP → "🛑 E-STOP" (normal red style), enabled=True
+      STANDBY → enabled
+
+─── AUTOMATIC SAFETY MONITORING ─────────────────────────────────────────────
+
+Enabled via: self.safety["enabled"] (bool, toggled in Safety tab)
+Called by: _vals() every 100 ms, reads from Snap dict (no serial I/O)
+
+self.safety dict keys (all floats):
+  ch1_max_temp     = 1000.0 °C    max PV before auto-standby trip
+  ch1_warn_pct     = 10.0  %      warn when PV ≥ max*(1 - warn_pct/100)
+  ch1_max_output   = 100.0 %      warn if output% exceeds this
+  ch1_max_ramp     = 100.0 °C/min informational (not auto-enforced)
+  ch1_standby_temp = 50.0  °C     SP set when safety standby triggered
+  ch1_standby_ramp = 10.0  °C/min ramp rate used during standby descent
+  (same ch2_* keys with defaults: max=700°C, standby_temp=50°C, standby_ramp=10°C/min)
+  in_max_temp      = 900.0  °C    Indium hard limit
+  in_warn_pct      = 10.0   %
+  in_max_output    = 100.0  %
+  in_max_ramp      = 100.0  °C/min
+  in_standby_temp  = 200.0  °C    hold above In solidification point (~157°C)
+  in_standby_ramp  = 15.0   °C/min
+
+_check_safety(d) logic per channel:
+  if pv >= max_temp:
+    → ch_widget.set_safety_state("trip")  (red 2px border)
+    → if trip_key not in _safety_tripped: add to set, log ⚠ SAFETY TRIP,
+      call _safe_standby_ch(ch) in daemon thread
+  elif pv >= warn_t (= max*(1-warn_pct/100)):
+    → ch_widget.set_safety_state("warn")  (orange 2px border)
+    → rate-limited log (30s cooldown, keyed per channel) ⚠ WARNING
+  else:
+    → discard trip_key from _safety_tripped
+    → ch_widget.set_safety_state("ok")   (restore normal border)
+  if out > max_out:
+    → rate-limited log warning (30s cooldown)
+
+  _sf_status label updated: "✓ OK" (green) / "⚠ WARNING" (orange) / "⛔ TRIPPED" (red)
+
+_safe_standby_ch(ch):
+  Daemon thread: go_standby(ch) + write_ramp_rate(ch, standby_ramp) +
+  apply_setpoint(ch, standby_temp) — uses ch{n}_standby_* from self.safety dict.
+
+_safe_standby_in():
+  Daemon thread: indium.go_standby(1) + write_ramp_rate(1, in_standby_ramp) +
+  apply_setpoint(1, in_standby_temp) — uses in_standby_* from self.safety dict.
+  Called on Indium safety trip (in_pv ≥ in_max_temp).
+
+TempCh.set_safety_state(state):
+  "trip" → QFrame border 2px solid RD (red)
+  "warn" → QFrame border 2px solid OR (orange)
+  "ok"   → restore 1px solid self._ac (channel accent color)
+
+Rate limiting: self._safety_warn_t dict, keyed f"ch{n}_temp_warn" / f"ch{n}_out_warn"
+  Warnings logged at most once per 30 s per key (time.monotonic).
+Trip set: self._safety_tripped — trip cleared when PV drops below warn threshold.
+
+Rate limiting: self._safety_warn_t dict, keyed per channel/type:
+  f"ch{n}_temp_warn" / f"ch{n}_out_warn" (HEAT3)
+  "in_temp_warn" / "in_out_warn" (EPC3004)
+  Warnings logged at most once per 30 s per key (time.monotonic).
+Trip set: self._safety_tripped — entries: "ch1_temp", "ch2_temp", "in_temp"
+  Trips cleared when PV drops below warn threshold.
+
+─── SAFETY TAB (⚠ Safety) ────────────────────────────────────────────────────
+
+Location: 4th tab in main QTabWidget (after BEP)
+Contents:
+  • Enable Safety Monitoring checkbox (self._sf_enabled) + live status label
+  • Info banner explaining auto-standby behavior
+  • Three QGroupBox panels (CH1 Selenium, CH2 Substrate, In Indium EPC3004), each with:
+      Limits section:
+        Max Temp (°C)    — PV threshold for auto-standby trip
+        Warn within (%)  — warn when PV is within this % of max
+        Max Output (%)   — output% warn threshold
+        Max Ramp Rate (°C/min) — informational spinbox (not auto-enforced)
+      Standby Settings section:
+        Standby Temp (°C)  — SP applied on trip/standby
+        Standby Ramp (°C/min) — device ramp rate on trip/standby
+  • Apply button → _safety_apply(): iterates ["ch1_", "ch2_", "in_"], copies spinbox
+    values into self.safety dict, updates self.safety["enabled"] from checkbox
+  • Reset Trips button → clears _safety_tripped, resets ch1/ch2/ch_in TempCh borders
+
+================================================================================
+SECTION 17: HOW TO ADD A NEW HARDWARE DEVICE
+================================================================================
+
+1. Create devices/newdevice.py with:
+   - connect() → bool (raise ConnectionError on failure)
+   - disconnect() → None
+   - connected: bool attribute
+2. Create devices/sim_devices.py SimNewDevice class with identical interface
+3. Add to Snap fields in gui_app.py
+4. Add to Poller._loop() for polling
+5. Add connect/disconnect in _resolve()
+6. Add to closeEvent cleanup
+7. Wire status LED in _build_left()
+
+################################################################################
+# END OF CONTEXT FILE
+# Total sections: 17 + Section 4b (EPC3004 hardware)
+# Key files: gui_app.py, heat3.py, epc3004.py, recipe_engine.py,
+#            bep_manager.py, sim_devices.py, recipe_logger.py,
+#            data_logger.py, brax3400.py, arduino_shutter.py
+# Diagnostics: diagnostics/timing_diag.py  ← hardware perf
+#              diagnostics/plot_diag.py     ← GUI plot pipeline perf
+#
+# ── Changelog ────────────────────────────────────────────────────────────────
+#
+# 2026-05-06  RAMP_TEMP action added; WAIT_TEMP channel-select bug fixed (BUG 9).
+#             Recipe table expanded to 6 columns (added Rate °C/min col for RAMP_TEMP).
+#             HEAT3 device-internal ramp rate exposed: read_ramp_rate(ch) /
+#             write_ramp_rate(ch, °C/min) in heat3.py.  Dev Ramp spinbox + Set button
+#             added to TempCh panel.  SP Apply is now always-instant (device ramp governs).
+#             _read_device_ramp_rates() called on HEAT3 connect and test-mode activate.
+#
+# 2026-05-08  Full performance overhaul — Round 1 (hardware serial) + Round 2 (software):
+#             HEAT3: read(expected) fix → no more 250ms timeout per 7-byte response (BUG 12).
+#             BRAX: read_until(b'\r') fix → no more readline() timeout (BUG 13); COM11 conf.
+#             DataLogger internal poll thread eliminated; Poller.feed() is single read path.
+#             Poller interval correctly wired from cfg (was always 1.0s regardless of Settings).
+#             Default poll interval: 0.5s → 0.25s; min setting: 0.2s → 0.10s.
+#             PlotWorker: 250ms sleep → 100ms; rolling window filter; absolute timestamps.
+#             DateAxisItem: x-axis shows real wall-clock time (HH:MM:SS).
+#             Rolling window buttons: 1 min / 10 min / 30 min / 1 hr (default 10 min).
+#             All output files: logs/ subfolder auto-created; was CWD (BUG 18).
+#             Achieved: ~4 Hz data rate; ~50ms buffer→plot latency.
+#             New diagnostic: diagnostics/plot_diag.py (no hardware needed).
+#             Bugs documented: BUG 12 through BUG 18.
+#
+# 2026-05-09  BEP overhaul, RAMP_TEMP redesign, recipe UI improvements, COM port fixes:
+#
+#   BEP (bep_manager.py):
+#             BUG 25 fixed: BEP calc was selecting bottom half of open-window samples
+#             (wrong slice index). Now takes top TOP_FRACTION=50% → peak = mean(top 50%).
+#             BEPTrace class added: full annotated timeline (baseline + open window) per source,
+#             including phase timestamps, top-fraction sample list, computed values.
+#             BEPManager stores self.trace_in, self.trace_se after each measurement.
+#
+#   BEP fast trace plot (gui_app.py, ⚡ Fast Trace tab):
+#             BUG 26 fixed: now shows both In and Se simultaneously from baseline start (t=0).
+#             Annotations: shaded open-window band, top-fraction scatter, baseline dashed line,
+#             BEP-level solid line, legend.  Items cleared/rebuilt after each measurement.
+#
+#   RAMP_TEMP (recipe_engine.py):
+#             BUG 27 fixed: old software-stepping (step SP every 5s) replaced with single
+#             write_ramp_rate(ch, rate) call — sets device-internal ramp, no SP churning.
+#             Rate now in Param2. Recipe pattern: RAMP_TEMP → SET_TEMP → WAIT_TEMP.
+#
+#   Recipe table (gui_app.py):
+#             BUG 28 fixed: Rate column (col 4) removed; table now 5 columns.
+#             RAMP_TEMP rate in Param2. Old 6-col Excel files still load correctly.
+#             Column guide updated.
+#
+#   Recipe Preview plot (gui_app.py, bottom of recipe tab):
+#             New: pyqtgraph estimated-timeline preview, rebuilt on each table edit (400ms
+#             debounce). Shows Se/Sub temp trajectories, shutter backgrounds (In=green,
+#             Se=orange-red, both=green), GOTO dashed-box with "?×N" label, RAMP_TEMP
+#             dashed vertical markers, WAIT_TEMP/WAIT_PRESSURE gray placeholder bands.
+#
+#   Excel report (recipe_logger.py):
+#             Sheet 5 "BEP Fast Trace" added: summary stats, raw trace data, two line charts
+#             (Indium and Selenium). Only present when BEP measurement was taken before run.
+#             rec_log.bep_trace_in / bep_trace_se populated in _r_run().
+#
+#   COM port defaults (gui_app.py):
+#             BRAX: COM4 → COM11; Arduino: COM5 → COM7 (confirmed lab assignments).
+#             Settings dialog HEAT3 baud default corrected: 57600 → 19200.
+#
+#   Context file: Section 6 RAMP_TEMP, Section 5 recipe table, Section 7 exports,
+#                 Section 8 BEP, Section 12 param conventions, Section 13 ports,
+#                 Section 15 add-action guide all updated.  BUGs 25–28 documented.
+#
+# 2026-05-11  EPC3004 Indium source controller fully integrated:
+#
+#   New hardware driver (devices/epc3004.py):
+#             Eurotherm EPC3004 single-loop PID, Modbus RTU, RS-485, 19200 baud 8N1.
+#             poll_all() → in_pv/in_sp/in_op/in_out snap dict keys.
+#             apply_setpoint(1, °C), go_operate(1), go_standby(1),
+#             read_ramp_rate(1), write_ramp_rate(1, rate), ch1_* legacy aliases.
+#             debug_callback attribute for raw TX/RX hex logging.
+#
+#   Simulation (devices/sim_devices.py):
+#             EPC3004Sim added using existing _ChannelSim thermal model.
+#             Full API match: poll_all(), apply_setpoint(), go_operate/standby(),
+#             read/write_ramp_rate(), ch1_* aliases.
+#
+#   devices/__init__.py: EPC3004 and EPC3004Sim exported.
+#
+#   DataLogger (data_logger.py):
+#             in_temp_buf deque added; feed() gains in_t=None kwarg.
+#             CSV column "In_Temp_C" added. get_in_temp_history() added.
+#
+#   BEP Manager (bep_manager.py):
+#             self.indium attribute added. _get_in_temp() reads live PV from EPC3004
+#             with fallback to INDIUM_TEMP_C=744.0°C constant.
+#
+#   Recipe Engine (recipe_engine.py):
+#             self.indium attribute added. _is_indium_src() staticmethod added.
+#             SET_TEMP, RAMP_TEMP, WAIT_TEMP, HEATER_ON, HEATER_OFF all route to
+#             self.indium when _is_indium_src(param1) is True.
+#
+#   Recipe Logger (recipe_logger.py):
+#             self.indium attribute added. _rows_temp rows extended to 5 elements
+#             (adds in_c). Temperature sheet exports In_C column. Excel chart adds
+#             3rd temperature series (In_C, cyan). Run Info shows live In temp.
+#
+#   GUI (gui_app.py):
+#             EPC3004 panel: "EPC3004 — Indium Controller" group box with TempCh
+#             (cyan, IN_C=#8be9fd) in left panel. Full operate/standby/SP/ramp controls.
+#             Topbar: epc3004_port combobox + "EPC3004" LED indicator added.
+#             Live plot: tc3 (cyan) Indium temperature curve added to temperature chart.
+#             BEP tab: bep_itl shows live "In: X.X°C (live)" when EPC3004 connected.
+#             STANDBY: Indium → 200°C @15°C/min (OPERATING).
+#             E-STOP: Indium → standby, SP→0, ramp→0.
+#             Safety tab: Indium group box added (max=900°C, standby=200°C, ramp=15°C/min).
+#             _check_safety(): Indium in_pv/in_out checked; _safe_standby_in() on trip.
+#             Settings dialog: EPC3004 Port, Slave ID, Baud fields added.
+#             Hardware menu: "Connect EPC3004" entry added.
+#             _conn_epc(), _disc_all(), closeEvent() updated for EPC3004.
+#             _read_device_ramp_rates() now also reads EPC3004 ramp rate.
+#             _sync_rec_log() pushes row[4] (in_t) to in_temp_buf.
+#             New Section 4b (EPC3004 hardware) and all relevant sections updated.
+#
+# 2026-05-11  Safety system added (gui_app.py):
+#
+#   Top-bar safety buttons (centered between title and controls):
+#     ⏸ STANDBY button (yellow): soft preset, no latch.
+#       Se (CH1): write_ramp_rate(1, 4.0) + apply_setpoint(1, 50.0) → stays OPERATING.
+#       Sub (CH2): go_standby(2) + write_ramp_rate(2, 100.0).
+#       Both shutters closed.  Button re-enables after execution.
+#       FUTURE: Indium (200°C, 15°C/min) to be added.
+#     🛑 E-STOP button (red): latches on first click.
+#       Sends both channels to Standby + SP→0, ramp→0, closes shutters.
+#       Stays latched ("↺ CLICK TO RESET") until user clicks again and confirms
+#       QMessageBox dialog.  Standby button disabled while E-STOP latched.
+#       On clear: _safety_latch=None, _safety_tripped.clear(), borders reset.
+#
+#   Automatic safety monitoring (_check_safety(), called every 100 ms from _vals()):
+#     Reads ch{n}_pv and ch{n}_out from Snap dict (no serial I/O).
+#     PV ≥ max_temp → auto-standby via _safe_standby_ch(ch) + red TempCh border.
+#     PV ≥ warn threshold → orange border + 30s rate-limited log warning.
+#     Output > max_output → 30s rate-limited log warning.
+#     _sf_status label: ✓ OK / ⚠ WARNING / ⛔ TRIPPED.
+#     TempCh.set_safety_state("ok"|"warn"|"trip") added for border feedback.
+#
+#   Safety tab (⚠ Safety, 4th tab):
+#     Per-channel limits: Max Temp, Warn within %, Max Output %, Max Ramp Rate.
+#     Per-channel standby settings: Standby Temp, Standby Ramp.
+#     Apply button saves to self.safety dict.  Reset Trips button clears trip state.
+#     Enable Safety Monitoring checkbox.
+#
+#   New Section 16 (Safety System) added to this context file.
+#
+# 2026-05-11  EPC3004 register map corrected by live hardware diagnostic:
+#
+#   Diagnostic tool (diagnostics/epc3004_diag.py):
+#             New standalone script. Sections A-K cover: raw comms check,
+#             slave ID scan (1-8), key register probe with both resolution
+#             factors, block scan (regs 0-9 and 271-277), SP write test,
+#             Auto/Manual mode check, RS-485 timing sweep (10/30/50ms),
+#             baud rate sweep (9600/19200/38400), resolution factor conclusion,
+#             writable SP scan across 7 candidate addresses, ramp register scan.
+#             Run with GUI closed (exclusive serial port).
+#             Usage: python diagnostics/epc3004_diag.py [port] [slave_id] [baud]
+#
+#   Findings from first successful diagnostic run (COM13, slave 1, 19200):
+#
+#   1. RESOLUTION_FACTOR = 10 (was 1):
+#             PV raw=2000, factor=1 → 2000°C (impossible).
+#             PV raw=2000, factor=10 → 200.0°C (Indium standby temp — correct).
+#             Fixed: EPC3004.RESOLUTION_FACTOR = 10 in devices/epc3004.py.
+#
+#   2. R_SP write address corrected 0x0002 → 0x0018:
+#             reg 0x0002 (frame addr 2) is the Working Setpoint (read-only).
+#             Write to 0x0002 returns Modbus exception FC=0x06 code=2 (Illegal address).
+#             reg 0x0018 (frame addr 24) is the writable Target Setpoint 1.
+#             Confirmed by write (raw=500) + readback (raw=500) test.
+#             Fixed: R_SP = 0x0018; R_SP_RO = 0x0002 added (read-only display alias).
+#             apply_setpoint() now writes and reads back from R_SP (0x0018).
+#             poll_all() still reads in_sp from R_SP_RO (0x0002) for live
+#             working-SP display during ramps.
+#
+#   3. Ramp rate registers corrected 0x0023/0x0024 → 0x0020/0x0021:
+#             Old R_SP_RATE = 0x0023 read 0; R_SP_RATE_U = 0x0024 returned
+#             0x8000 sentinel (Eurotherm "not applicable" — parameter does not
+#             exist at this address on this firmware).
+#             New R_SP_RATE = 0x0020 reads 1000 = 100.0°C/min (×10 encoding).
+#             New R_SP_RATE_U = 0x0021 reads 0 = off (ramp currently disabled).
+#             Fixed: R_SP_RATE = 0x0020, R_SP_RATE_U = 0x0021 in epc3004.py.
+#             NOTE: write access to 0x0020/0x0021 not yet tested — if
+#             write_ramp_rate() fails in the GUI, use iTools to locate the
+#             correct writable ramp address and update accordingly.
+#
+#   Section 4b (EPC3004 hardware) fully updated with confirmed register map.
+#
+################################################################################
