@@ -563,6 +563,13 @@ TOP-BAR SAFETY BUTTONS (self.standby_btn, self.estop_btn):
   Centered between title and right-side controls in _topbar().
   See Section 16 for full behavior.
 
+WINDOW SIZING (main.py + _build()):
+  Minimum size: 900×600 px (allows use on smaller monitors).
+  On startup: resized to 90% of the primary screen's available geometry
+    (w = max(900, screen.width()*0.90), h = max(600, screen.height()*0.90)).
+  Left/right splitter: setStretchFactor(0,1) / setStretchFactor(1,2) —
+    proportional scaling instead of fixed pixel splits.
+
 TIMERS:
   self._vt    100ms → _vals()              (reads Snap, updates labels)
   self._pt    100ms → _sync_rec_log()      (copies rec_log rows into plot buffers)
@@ -1490,16 +1497,16 @@ OVERVIEW:
 
 STANDBY BUTTON (yellow, ⏸ STANDBY):
   Style: gold background (#b8860b), #ffd700 border
-  Behavior: SOFT PRESET — no latch, no reset required.
+  Behavior: SOFT PRESET — no latch, no reset required. Can be clicked repeatedly
+    back-to-back; button is never disabled (fire-and-forget daemon thread).
   Action (fire-and-forget, runs in daemon thread):
     1. shutter.both_close()
     2. CH1 (Se): heat3.write_ramp_rate(1, 4.0) + heat3.apply_setpoint(1, 50.0)
        → stays OPERATING, ramps down gracefully to 50°C at 4°C/min
     3. CH2 (Sub): heat3.go_standby(2) + heat3.write_ramp_rate(2, 100.0)
        → enters STANDBY state, ramp set for next operation
-    4. Indium (EPC3004): epc.write_ramp_rate(1, 15.0) + epc.apply_setpoint(1, 200.0)
+    4. Indium (EPC3004): epc.write_ramp_rate(1, 100.0) + epc.apply_setpoint(1, 200.0)
        → stays OPERATING, ramps to 200°C hold (above solidification ~157°C)
-  Button disables during execution, re-enables when done (QTimer.singleShot).
 
 E-STOP BUTTON (red, 🛑 E-STOP):
   Style: RD background, #ff8888 border
@@ -1538,13 +1545,13 @@ self.safety dict keys (all floats):
   ch1_max_ramp     = 100.0 °C/min informational (not auto-enforced)
   ch1_standby_temp = 50.0  °C     SP set when safety standby triggered
   ch1_standby_ramp = 10.0  °C/min ramp rate used during standby descent
-  (same ch2_* keys with defaults: max=700°C, standby_temp=50°C, standby_ramp=10°C/min)
+  (same ch2_* keys with defaults: max=900°C, standby_temp=50°C, standby_ramp=10°C/min)
   in_max_temp      = 900.0  °C    Indium hard limit
   in_warn_pct      = 10.0   %
   in_max_output    = 100.0  %
   in_max_ramp      = 100.0  °C/min
   in_standby_temp  = 200.0  °C    hold above In solidification point (~157°C)
-  in_standby_ramp  = 15.0   °C/min
+  in_standby_ramp  = 100.0  °C/min
 
 _check_safety(d) logic per channel:
   if pv >= max_temp:
@@ -1818,5 +1825,28 @@ SECTION 17: HOW TO ADD A NEW HARDWARE DEVICE
 #             correct writable ramp address and update accordingly.
 #
 #   Section 4b (EPC3004 hardware) fully updated with confirmed register map.
+#
+# 2026-05-15  UI scaling, standby button, and safety default fixes:
+#
+#   Window sizing (main.py + gui_app.py):
+#             setMinimumSize changed 1380×880 → 900×600 (usable on smaller monitors).
+#             main.py now resizes the window to 90% of the primary screen's available
+#             geometry on startup (min 900×600) so it always fits the display.
+#             Left/right QSplitter now uses setStretchFactor(0,1)/setStretchFactor(1,2)
+#             for proportional scaling instead of fixed 460+940 px pixel splits.
+#             Section 5 WINDOW SIZING note added.
+#
+#   STANDBY button (gui_app.py _standby_all_click):
+#             Button no longer calls setEnabled(False) during execution.
+#             It is permanently clickable — each click fires a new daemon thread
+#             applying the same preset (fire-and-forget). This allows rapid repeated
+#             presses without waiting for the previous Modbus sequence to finish.
+#
+#   Safety defaults (gui_app.py __init__ self.safety):
+#             Indium standby ramp: 15.0 → 100.0 °C/min
+#             Substrate (CH2) max temp: 700.0 → 900.0 °C
+#             Safety tab spinbox defaults updated to match.
+#             Tooltip and log message in _standby_all_click updated to reflect
+#             In ramp 100°C/min.
 #
 ################################################################################

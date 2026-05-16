@@ -50,8 +50,8 @@ _check_safety() called every 100 ms.  Monitors CH1, CH2, and Indium (EPC3004):
   PV ≥ max_temp  → safety trip: go_standby + SP → standby_temp at standby_ramp
   PV ≥ warn_t    → warning log (throttled to once per 30 s)
   output > max   → output warning
-Defaults: CH1 max=1000°C stby=50°C | CH2 max=700°C stby=50°C | In max=900°C stby=200°C
-STANDBY button: Se→50°C @4°/min (operating) | Sub→standby | In→200°C @15°/min
+Defaults: CH1 max=1000°C stby=50°C | CH2 max=900°C stby=50°C | In max=900°C stby=200°C
+STANDBY button: Se→50°C @4°/min (operating) | Sub→standby | In→200°C @100°/min
 E-STOP button:  all → standby, ramp→0, SP→0.  Latches; second click → reset dialog.
 
 Recipe engine
@@ -594,7 +594,7 @@ class MainWindow(QMainWindow):
             "ch1_max_ramp":   100.0,   # °C/min — informational max ramp
             "ch1_standby_temp": 50.0,  # SP set when standby is triggered
             "ch1_standby_ramp": 10.0,  # °C/min ramp rate used during standby descent
-            "ch2_max_temp":   700.0,
+            "ch2_max_temp":   900.0,
             "ch2_warn_pct":   10.0,
             "ch2_max_output": 100.0,
             "ch2_max_ramp":   100.0,
@@ -606,7 +606,7 @@ class MainWindow(QMainWindow):
             "in_max_output":  100.0,
             "in_max_ramp":    100.0,
             "in_standby_temp":  200.0, # hold at 200°C (above solidification point ~157°C)
-            "in_standby_ramp":  15.0,  # °C/min
+            "in_standby_ramp":  100.0, # °C/min
         }
         self._safety_warn_t  = {}    # key → last warning time (time.monotonic)
         self._safety_tripped = set() # channels currently safety-tripped
@@ -648,7 +648,7 @@ class MainWindow(QMainWindow):
 
     # ── Build UI ──────────────────────────────────────────────────────
     def _build(self):
-        self.setWindowTitle("Vacuum Deposition Control"); self.setMinimumSize(1380,880)
+        self.setWindowTitle("Vacuum Deposition Control"); self.setMinimumSize(900,600)
         mb=self.menuBar()
         fm=mb.addMenu("File"); fm.addAction("Settings…",self._settings); fm.addAction("Load Recipe…",self._load_recipe)
         fm.addAction("Export Firmware…",self._export_fw); fm.addSeparator(); fm.addAction("Quit",self.close)
@@ -658,7 +658,8 @@ class MainWindow(QMainWindow):
         root=QVBoxLayout(c); root.setContentsMargins(8,4,8,4); root.setSpacing(6)
         root.addWidget(self._topbar())
         spl=QSplitter(Qt.Horizontal); spl.addWidget(self._left()); spl.addWidget(self._right())
-        spl.setSizes([460,940]); root.addWidget(spl); self.statusBar().showMessage("Ready")
+        spl.setStretchFactor(0, 1); spl.setStretchFactor(1, 2)
+        root.addWidget(spl); self.statusBar().showMessage("Ready")
 
     def _topbar(self):
         bar=QFrame(); bar.setStyleSheet(f"background:{PBG};border-radius:6px;border:1px solid {BDR};"); bar.setFixedHeight(46)
@@ -695,7 +696,7 @@ class MainWindow(QMainWindow):
             "• Close all shutters\n"
             "• Se (CH1): ramp 4 °C/min → SP 50 °C  (stays OPERATING)\n"
             "• Sub (CH2): go STANDBY, ramp 100 °C/min\n"
-            "• Indium (EPC3004): ramp 15 °C/min → SP 200 °C  (stays OPERATING)"
+            "• Indium (EPC3004): ramp 100 °C/min → SP 200 °C  (stays OPERATING)"
         )
         self.standby_btn.clicked.connect(self._standby_all_click)
 
@@ -1439,10 +1440,9 @@ class MainWindow(QMainWindow):
         • Se (CH1): ramp 4 °C/min, SP → 50 °C, stays OPERATING
         • Sub (CH2): go STANDBY, ramp 100 °C/min
         """
-        self.standby_btn.setEnabled(False)
         self._log(
             f"<span style='color:#ffd700;font-weight:bold'>⏸ STANDBY — "
-            f"shutters closed | Se→50°C @4°/min (operating) | Sub→standby @100°/min | In→200°C @15°/min</span>"
+            f"shutters closed | Se→50°C @4°/min (operating) | Sub→standby @100°/min | In→200°C @100°/min</span>"
         )
         def _do():
             sh = self.shutter
@@ -1468,11 +1468,10 @@ class MainWindow(QMainWindow):
             if epc:
                 # Indium — stays OPERATING, ramp to 200°C hold point (above solidification ~157°C)
                 try:
-                    if hasattr(epc, "write_ramp_rate"): epc.write_ramp_rate(1, 15.0)
+                    if hasattr(epc, "write_ramp_rate"): epc.write_ramp_rate(1, 100.0)
                     epc.apply_setpoint(1, 200.0)
                 except Exception as ex:
                     QTimer.singleShot(0, lambda e=ex: self._log(f"In standby SP error: {e}"))
-            QTimer.singleShot(0, lambda: self.standby_btn.setEnabled(True))
         threading.Thread(target=_do, daemon=True).start()
 
     def _estop_click(self):
@@ -2099,7 +2098,7 @@ class MainWindow(QMainWindow):
 
         # Per-channel group boxes
         ch_row = QHBoxLayout(); ch_row.setSpacing(14)
-        for ch, name, def_max in [(1, "Selenium", 1000.0), (2, "Substrate", 700.0), ("in", "Indium (EPC3004)", 900.0)]:
+        for ch, name, def_max in [(1, "Selenium", 1000.0), (2, "Substrate", 900.0), ("in", "Indium (EPC3004)", 900.0)]:
             pfx = f"ch{ch}_" if ch != "in" else "in_"
             g_title = f"CH{ch} — {name}" if ch != "in" else f"In — {name}"
             g = QGroupBox(g_title); g.setStyleSheet(self._gs())

@@ -36,6 +36,10 @@ def main():
     apply_dark_theme(app)
 
     window = MainWindow()
+    screen = app.primaryScreen().availableGeometry()
+    w = max(900, int(screen.width()  * 0.90))
+    h = max(600, int(screen.height() * 0.90))
+    window.resize(w, h)
     window.show()
     sys.exit(app.exec_())
 
