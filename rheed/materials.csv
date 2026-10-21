@@ -1,0 +1,39 @@
+# RHEED surface-net table for identification (rheed/spatial.py). EDIT FREELY.
+# lattice = 2D surface net: hex | square | rect ; a, b in Angstrom (b only for rect).
+# a = PRIMITIVE surface-net constant (NOT always the bulk cell): cubic F (001)/(111)
+# use a_bulk/sqrt(2); hexagonal (0001) uses a. Bulk values from the Crystallography
+# Open Database (COD id in "source"), 2026-10-06, room temperature.
+# Row spacings used: hex beam||<11-20> d=a*sqrt(3)/2, beam||<1-100> d=a/2;
+# square <10> d=a, <11> d=a/sqrt(2); rect: d=b, a, ab/sqrt(a^2+b^2).
+name,lattice,a,b,surface,source
+Al2O3 sapphire,hex,4.759,,(0001),COD 1000017 (a=4.759 c=12.99)
+Si,square,3.840,,(001),COD 9008565 (a=5.431)/sqrt2
+Si,hex,3.840,,(111),COD 9008565 (a=5.431)/sqrt2
+Ge,square,4.001,,(001),COD 9008567 (a=5.658)/sqrt2
+Ge,hex,4.001,,(111),COD 9008567 (a=5.658)/sqrt2
+GaAs,square,3.998,,(001),COD 9008845 (a=5.654)/sqrt2
+GaAs,hex,3.998,,(111),COD 9008845 (a=5.654)/sqrt2
+InP,square,4.144,,(001),COD 1010146 (a=5.86)/sqrt2
+InAs,square,4.283,,(001),COD 1535065 (a=6.058)/sqrt2
+InAs,hex,4.283,,(111),COD 1535065 (a=6.058)/sqrt2
+GaN,hex,3.189,,(0001),COD 1010168 (a=3.189 c=5.185)
+ZnO,hex,3.249,,(0001),COD 2300112 (a=3.249 c=5.21)
+MgO,square,2.978,,(001),COD 1011117 (a=4.212)/sqrt2
+SrTiO3,square,3.905,,(001),COD 1577245 (a=3.905)
+graphite / graphene,hex,2.464,,(0001),COD 1000065 (a=2.46)
+hBN,hex,2.504,,(0001),COD 1010330 (a=2.504)
+muscovite mica,hex,5.19,,(001),literature (pseudo-hex a~5.19 b~9.0) - approximate
+MoS2,hex,3.161,,(0001),COD 9007660 (a=3.161 c=12.30)
+MoSe2,hex,3.289,,(0001),COD 2310945 (a=3.289 c=12.93)
+WSe2,hex,3.286,,(0001),COD 9009146 (a=3.286 c=12.97)
+Bi2Se3,hex,4.143,,(0001),COD 9011965 (a=4.143 c=28.6)
+Bi2Te3,hex,4.386,,(0001),COD 9011962 (a=4.386 c=30.5)
+InSe,hex,4.002,,(0001),COD 1534648 (R3m a=4.00 c=24.9)
+alpha/beta-In2Se3,hex,4.05,,(0001),COD 1528774/1528775 (R-3m/R3m a=4.05)
+gamma-In2Se3,hex,7.11,,(0001),COD 2106380 (P61 a=7.11 c=19.34)
+GaSe,hex,3.750,,(0001),COD 1530863 (a=3.750 c=15.9)
+Se (trigonal),hex,4.366,,(0001),COD 9011648 (P3121 a=4.366 c=4.954)
+In (tetragonal),square,3.252,,(001),COD 1539229 (I4/mmm a=3.252 c=4.946)
+CdSe (wurtzite),hex,4.30,,(0001),COD 9008863 (a=4.30 c=7.01)
+CuInSe2,square,5.78,,(001),COD 4105292 (I-42d a=5.78 c=11.6)
+SnSe,rect,4.186,4.44,(100),COD 1537675 (Pnma b=4.186 c=4.44)

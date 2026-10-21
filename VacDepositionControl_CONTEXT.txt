@@ -14,14 +14,25 @@ TOOL:    MBE / Physical Vapor Deposition (PVD) system — Selenium + Indium sour
 STACK:   Python 3.11 / PyQt5 / pyqtgraph / pyserial / openpyxl / PyInstaller
 ENTRY:   python vac_control/main.py
 BUILD:   pyinstaller build.spec  → dist/VacDepositionControl.exe (Windows)
+         pyinstaller recipe_editor.spec → dist/RecipeEditor/RecipeEditor.exe
+           (standalone recipe builder, no hardware deps — see Section 19)
 TESTS:   python test_recipe.py   (headless, mocks serial/modbus)
+         ⚠ BROKEN as of 2026-09: hardcoded path /mnt/user-data/uploads/recipe.xlsx
+           (authored elsewhere); fails with FileNotFoundError before testing anything.
 
 FILE TREE:
   vac_control/
     main.py                  # entry point, dark theme, logging config
+    log_paths.py             # WHERE ALL LOGS GO: ~/Box/logs/{system,deposition,rheed} (Section 12)
+    wheel_guard.py           # app-wide filter: mouse wheel never changes spin boxes / dropdowns /
+                             #   sliders (Section 12) — installed by every entry point
     gui_app.py               # MainWindow (PyQt5), all UI, timers, signal bridge
     recipe_engine.py         # thread state machine: IDLE→RUNNING→PAUSED→DONE/ERROR
-    recipe_logger.py         # 1Hz logger during run → 5-sheet .xlsx export (incl. BEP Fast Trace)
+    recipe_editor.py         # STANDALONE recipe builder GUI — no hardware/pyserial
+                             #   deps; same table + preview as the Recipe tab (Section 19)
+    recipe_editor.spec       # PyInstaller spec → dist/RecipeEditor/RecipeEditor.exe
+    recipe_logger.py         # 1Hz logger during run → .xlsx export (5 base sheets +
+                             #   one bep_measure_rec_# sheet per in-recipe MEASURE_BEP)
     bep_manager.py           # BEP measurement workflow (20Hz fast sampling)
     data_logger.py           # background CSV logger + deque plot buffers
     CovapDuty_v2.ino         # Arduino firmware (standalone copy at root)
@@ -31,14 +42,40 @@ FILE TREE:
       brax3400.py            # B-RAX 3400 RS-485 ASCII driver (real hardware)
       arduino_shutter.py     # Arduino serial ASCII driver (real hardware)
       epc3004.py             # Eurotherm EPC3004 single-loop PID driver (Indium source)
+      ln2_monitor.py          # LN2 dewar level tracker — Air Products APDirect (see Section 18)
       sim_devices.py         # BRAX3400Sim, HEAT3Sim, ArduinoShutterSim, EPC3004Sim (test mode)
       __init__.py
+    rheed/                   # RHEED camera + analysis package (Section 20) — Qt-free core,
+      camera.py              #   RHEEDCamera (UVC via OpenCV), SimRHEEDCamera, VideoReplayCamera,
+                             #     list_cameras()
+      tracking.py            #   RotationLock + IntensityTracker — live phase-locked RHEED
+                             #     intensity (oscillations), worker threads, Qt-free
+      live_tracking.py       #   TrackingGroup — live panel controls + 📈 plot + cyan box
+      rotation.py            #   rotation-period detection + best-azimuth selection (numpy only)
+      capture.py             #   RotationCapture, VideoRecorder, save_snapshot (worker threads)
+      video_analysis.py      #   VideoAnalysis / ProfileExtraction — offline analysis of a video
+                             #     FILE, results IN MEMORY (nothing written)
+      spatial.py             #   azimuth-locked spatial analysis: profiles, peaks, spacing,
+                             #     intensity vs time, FFT, calibration, identification, COD
+      materials.csv          #   surface-net table for identification (editable)
+      export.py              #   export_analysis() — the ONLY writer of video-analysis files
+      video_steps.py         #   SpatialStep (② Spatial) + ExportStep (③ Export) widgets
+      ui_common.py           #   shared palette + widget helpers for the panels
+      rheed_tab.py           #   RHEEDTab(QWidget) — 2 modes: 📡 Live camera (RHEEDLivePanel)
+      video_tab.py           #     + 🎞 Video analysis (RHEEDVideoPanel); future main-app tab
+    rheed_app.py             # STANDALONE RHEED window (python rheed_app.py [--sim] [--video F])
     diagnostics/
       timing_diag.py         # poll-cycle timing benchmark (run standalone, no GUI)
       plot_diag.py           # GUI plot pipeline diagnostic (no hardware needed)
       heat3_diag.py          # HEAT3 CH2 setpoint investigation tool
       heat3_remote_test.py   # HEAT3 remote-enable diagnostic (PREVAC V2 protocol)
       heat3_remote_watchdog.py # HEAT3 watchdog / sequence simulator
+      rheed_camera_probe.py  # find the HDMI capture device index / formats (Section 20)
+    tools/
+      setup_ln2_credentials.py  # one-time interactive APDirect credential setup (run manually
+                                 # by the user in their own terminal — never through automation)
+    secrets/                  # gitignored — encrypted credentials only, never plaintext
+      ln2_creds.dat           # LN2 APDirect login, Windows-DPAPI-encrypted (see Section 18)
     recipes/
       create_recipe_template.py  # generates sample recipe.xlsx
       recipe.xlsx / recipe_template.xlsx / *.xlsx  # saved recipes + run logs
@@ -53,6 +90,11 @@ DEPENDENCIES (requirements.txt):
   pyqtgraph>=0.13.0
   pyserial>=3.5
   openpyxl>=3.0.0
+  requests>=2.28.0     # LN2 dewar monitor (APDirect login/readings)
+  opencv-python-headless>=4.8,<4.11   # RHEED camera (rheed/). INSTALLED 2026-10-01 as 4.10.0
+                       #   into the Anaconda base env. <4.11 because newer wheels pull numpy 2,
+                       #   which the env's scipy/pyqtgraph builds are not compiled against.
+                       #   "headless": no bundled Qt/HighGUI — display goes through PyQt5.
   pyinstaller>=5.0.0   # build only
 
 ================================================================================
@@ -196,7 +238,7 @@ SENSORS:      Ion Gauge (IG) + Convectron CG1 + Convectron CG2 + Analog Input
 PROTOCOL:     InstruTech RS-485 ASCII (COMM Type = RS485)
 BAUD:         19200, 8N1
 ADDRESS:      01 (hex, 00–FF, factory default = 01, configurable)
-DEFAULT PORT: COM11 (Prolific PL2303GT USB-RS485 adapter — confirmed by COM scan)
+DEFAULT PORT: COM3 since 2026-10-21 (was COM11, Prolific PL2303GT — Section 13)
               NOTE: was incorrectly assumed COM9; use serial.tools.list_ports to discover
 SERIAL TIMEOUT: 0.25s  (was 1.0s — reduced for speed)
 COMMAND SLEEP:  0.02s after write, before read_until (was 0.06s)
@@ -267,7 +309,7 @@ PURPOSE:      Single-loop PID temperature controller for the Indium evaporation 
 PROTOCOL:     Modbus RTU over RS-485
 BAUD:         19200, 8N1
 SLAVE ID:     1 (configurable)
-DEFAULT PORT: COM13 (configurable in Settings / DCFG)
+DEFAULT PORT: COM7 since 2026-10-21 (was COM13; configurable in Settings / DCFG)
 
 THERMOCOUPLE TYPE: Type C (W5%Re / W26%Re, ASTM E988), 0–2315°C
   The EPC3004 does not natively support Type C.
@@ -511,11 +553,39 @@ KEY DESIGN PATTERNS:
        Formula: total_execs = loops + 1; current_pass = total_loops - remaining + 1
        Display: "GOTO N [2/10]" (current pass / total passes)
      Updates rsk label: "Step N: ACTION param1 → param2"
+     Also calls _update_loop_label(i) (see 9b).
    _set_recipe_row_active(row, active):
      Active background: #3d2e00 (dark amber); text: #f1fa8c (Dracula yellow); border: OR
      Dual mechanism: selectRow/clearSelection for item cells + setStyleSheet for ComboBoxes
      viewport().update() forces immediate repaint
    Active row cleared on STATE_IDLE/DONE/ERROR.
+
+9b. RUN PROGRESS ROW (added 2026-09) — full-width QFrame under the toolbar/status line
+   in the Recipe tab, above the Column Guide. Always present (idle = 0% / "—").
+   Widgets:
+     self.rprog  QProgressBar 0–100, "%p%", BL chunk  — % of the estimated run elapsed
+     self.rloop  QLabel (OR, bold)  — "Loop: 3/5", which pass of the active GOTO
+     self.rleft  QLabel — "Elapsed: 5m 00s  •  Time left: 15m 00s (est.)"
+     self.reta   QLabel — "Est. done: HH:MM:SS"
+   State (MainWindow.__init__):
+     self._run_t0  = None   wall-clock start of the current run (time.time())
+     self._run_est = 0.0    loop-aware estimate = _simulate_recipe_timeline(steps)[0][-1]
+   _r_run(): computes _run_est from the steps about to run, sets _run_t0, zeroes the bar,
+     and logs "🟢 Run started: <name>  (N steps)  ~<est> est."
+   self._rt QTimer (1000 ms) → _update_run_progress():
+     returns immediately unless state is RUNNING/PAUSED; clamps 0–100 (an overrun shows
+     100% / "0s" rather than negative time left); with no estimate shows elapsed only.
+   _reset_run_progress() called from _r_state() on IDLE/DONE/ERROR.
+   ACCURACY CAVEAT: WAIT_TEMP / WAIT_PRESSURE are unknowable ahead of time and count as
+     the 120 s UNKNOWN_DT placeholder, so every label is marked "(est.)". The bar is
+     reliable for time-driven recipes (WAIT_TIME, ramps, loops, MEASURE_BEP).
+   _current_loop_info(row) → (current_pass, total_passes) | None:
+     Scans the table for GOTO rows; a row is "inside" a loop when target_row ≤ row ≤ goto_row,
+     where target_row = Param1 - 1 (step numbers are row order — see _rtab_to_steps).
+     Engine semantics: _loop_counters[goto_row] is created at `loops` and decremented
+     BEFORE each jump, so remaining == loops-k means pass k+1; an absent key means the
+     GOTO has not been reached yet (pass 1). Innermost loop wins when nested.
+   _update_loop_label(row) writes "p/total" or "—" into self.rloop.
 
 10. RECIPE TABLE DRAG-DROP REORDER:
     RecipeTable(QTableWidget) subclass — dropEvent suppresses Qt built-in move
@@ -535,19 +605,47 @@ KEY DESIGN PATTERNS:
       Orange line  = Se (CH1) temperature trajectory
       Purple line  = Sub (CH2) temperature trajectory
     Overlays (dynamically added/removed via self._rp_items list):
-      Shutter backgrounds: In open → bright green (#22ee44, alpha 50)
-                           Se open → orange-red (#ee6622, alpha 50)
-                           Both    → green (#22cc55, alpha 50)
+      Shutter backgrounds: In open   → green  (SRC_IN_C #22ee44, alpha 50)
+                           Se open   → orange (SRC_SE_C #ee6622, alpha 50)
+                           Both open → BLUE   (BL #5e9cf3, alpha 50)   ← changed 2026-09
+      MEASURE_BEP windows: silver band (BEP_C #c0c0c0, alpha 70, solid #e8e8e8 border)
+                           with bold source tags centred inside — green "In", orange
+                           "Se", or BOTH tags stacked when Param1 = Both.
       WAIT_TEMP / WAIT_PRESSURE regions: gray dotted-border band (UNKNOWN_DT=120s placeholder)
-      GOTO loop regions: white dashed border, centered "?×N" label (N = total executions)
+      GOTO loop regions: white dashed border, two-line centred label:
+                           "×N  (<total duration>)"
+                           "cycle length: <one-pass duration>"
       RAMP_TEMP events: vertical dashed line in channel color + rate label at top
-    Simulation (_simulate_recipe_timeline, @staticmethod):
+                        (Indium RAMP_TEMP sets in_rate but draws NO marker — the plot
+                         has no Indium curve)
+    Simulation (_simulate_recipe_timeline, @staticmethod; mirrored as the module-level
+    simulate_recipe_timeline() in recipe_editor.py):
+      Returns an 8-TUPLE (was 7 before 2026-09 — bep_regions appended):
+        pts_t, pts_se, pts_sub, shutter_segs, rate_markers,
+        goto_regions, unk_regions, bep_regions
       Tracks se_rate/sub_rate (°C/min) — updated by RAMP_TEMP steps (default 4/100 °C/min).
+      Also tracks in_t / in_rate (default 25°C / 100 °C/min) for TIMING ONLY — Indium is
+        not plotted, but an Indium calibration sweep must still advance the clock, and
+        must NOT move the Se/Sub traces (_src_to_ch would otherwise fall through to CH1).
       SET_TEMP: dt = |target - current| / rate * 60 s (proportional to rate and distance).
+      INCREASE_TEMP: dt = |delta| / rate * 60 s; target temp += delta.
+      MEASURE_BEP: dt = bep_duration(param1) (10 s single source / 50 s Both);
+        appends (t0, t1, source) to bep_regions.
       WAIT_TIME: dt = param1 seconds.
+      RHEED_VIDEO: dt = param1 seconds (blocks like WAIT_TIME; 0 = still → 1 s).
       WAIT_TEMP/WAIT_PRESSURE: dt = 120s (fixed, shown with gray region).
       OPEN/CLOSE_SHUTTER: updates shutter state tracking (no time advance).
-      GOTO: adds dashed-box region from target step time to current time; no unrolling.
+      GOTO: MULTIPLIES THE LOOP OUT IN TIME, drawing ONE STRETCHED CYCLE (2026-09).
+        The body is traced once at true size, then stretch(body_start, passes) scales
+        every collection recorded at/after body_start by `passes` about body_start —
+        pts_t, shutter_segs, unk_regions, rate_markers, goto_regions, bep_regions,
+        step_times and cur_sh_t — and t jumps to body_start + body_dur*passes.
+        NET: total estimate is loop-aware, and the single cycle fills the whole looped
+        span in proportion rather than leaving dead space after it.
+        CONSEQUENCE: the temperature trace shows ONE pass of an INCREASE_TEMP staircase,
+        not the cumulative climb; the ×N label carries the repetition.
+        Nested loops work: an outer stretch rescales the inner loop's region too.
+      pts_t[-1] is the total estimate — also consumed by the run progress bar (_r_run).
     Debounce timer (self._rp_timer, 400ms single-shot):
       Started by rtab.itemChanged, action combobox changes, param1 combobox changes.
       Fires _refresh_recipe_preview() which clears and redraws all dynamic items.
@@ -590,22 +688,43 @@ LOG WIDGET:
   self.log_w.append(html_string)  ← uses append (not appendHtml)
   auto-scrolls to bottom after each message
 
-OUTPUT FILES:
-  _LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")  (auto-created)
-  logs/pressure_log_YYYYMMDD_HHMMSS.csv     live log (DataLogger)
-  logs/YYYYMMDD_HHMMSS_samplename.xlsx      run log  (RecipeLogger)
+OUTPUT FILES (since 2026-10-21 — see Section 12 "LOG LOCATIONS"):
+  _LOG_DIR = log_paths.DEPOSITION_DIR
+  <LOG_ROOT>/system/pressure_log_YYYYMMDD_HHMMSS.csv   live log (DataLogger)
+  <LOG_ROOT>/deposition/YYYYMMDD_HHMMSS_sample.xlsx    run log  (RecipeLogger, via
+                                                       MainWindow._export_run_log)
 
 ACTION_CH_OPTS — actions that get a channel dropdown for Param1:
-  SET_TEMP, RAMP_TEMP, WAIT_TEMP, HEATER_ON, HEATER_OFF
+  SET_TEMP, RAMP_TEMP, INCREASE_TEMP, WAIT_TEMP, HEATER_ON, HEATER_OFF
     → ["Selenium (CH1)", "Substrate (CH2)", "Indium (EPC)"]
 
 ACTION_SHUTTER_OPTS — actions that get a source dropdown for Param1:
-  OPEN_SHUTTER, CLOSE_SHUTTER → ["In", "Se", "Both"]
+  OPEN_SHUTTER, CLOSE_SHUTTER, MEASURE_BEP → ["In", "Se", "Both"]
 
 ALL_ACTIONS (current):
-  SET_TEMP, RAMP_TEMP, WAIT_TEMP, WAIT_PRESSURE, WAIT_TIME,
+  SET_TEMP, RAMP_TEMP, INCREASE_TEMP, WAIT_TEMP, WAIT_PRESSURE, WAIT_TIME,
   OPEN_SHUTTER, CLOSE_SHUTTER,
-  IG_ON, IG_OFF, HEATER_ON, HEATER_OFF, GOTO, END
+  IG_ON, IG_OFF, HEATER_ON, HEATER_OFF, MEASURE_BEP, GOTO, END
+
+  *** These three constants are DUPLICATED verbatim in recipe_editor.py and MUST
+      stay in sync — a recipe authored in the standalone editor with an action the
+      runner does not know would load but never execute. ***
+
+SOURCE COLOUR CONSTANTS (gui_app.py + recipe_editor.py, used by the preview plot):
+  SRC_IN_C = "#22ee44"   Indium  — green
+  SRC_SE_C = "#ee6622"   Selenium — orange
+  BEP_C    = "#c0c0c0"   MEASURE_BEP window — silver
+  BL       = "#5e9cf3"   both shutters open — blue
+
+bep_duration(src) → float  (module-level, both files)
+  Wall-clock a MEASURE_BEP step costs, for the timeline estimate:
+    single source = BASELINE_DURATION + OPEN_DURATION          = 10 s
+    "Both"        = 2×10 + SETTLE_TIME                         = 50 s
+  Imports BASELINE_DURATION / OPEN_DURATION / SETTLE_TIME from bep_manager
+  (stdlib-only module, so recipe_editor stays hardware-free).
+
+fmt_duration(sec) → str  (module-level, both files)
+  "45s" / "12m 30s" / "2h 05m". Used by the GOTO label and the run progress row.
 
 RECIPE TABLE — 5 columns (Step | Action | Param1 | Param2 | Notes):
   Col 0: Step number (int, 1-based)
@@ -618,6 +737,20 @@ RECIPE TABLE — 5 columns (Step | Action | Param1 | Param2 | Notes):
 
   Excel save format: Step|Action|Param1|Param2|Notes  (5 cols)
   Old 6-col files load correctly via load_excel() 5/6-col auto-detect in recipe_engine.py.
+
+RECIPE TOOLBAR (added New + Save As 2026-09):
+  [🆕 New] [📂 Load] [💾 Save] [💾 Save As…]  …  [+ Row] [✕ Del] [▶ Run] [⏸] [⏹]
+  self._recipe_path  — file backing the table; set by _load_recipe / _do_save_recipe.
+  _do_save_recipe(path): writes the 5-col sheet, stores _recipe_path, updates self.rf.
+  _save_recipe():    saves over _recipe_path; falls back to Save As when there is none.
+                     (Before 2026-09 Save ALWAYS re-prompted with a file dialog.)
+  _save_recipe_as(): prompts, appends .xlsx when missing, then _do_save_recipe.
+  _new_recipe():     clears the table to one blank row, _recipe_path=None, rf="No file".
+                     REFUSED while state is RUNNING/PAUSED (QMessageBox warning) — the
+                     engine is executing the rows this table describes and the active-row
+                     highlight tracks it by index. Confirms before discarding a non-empty
+                     table. There is no dirty-flag in the runner (the standalone editor
+                     has one); the confirm is unconditional on a non-empty table.
 
 _rtab_to_steps() TYPE RULES:
   p1s, p2s = raw strings from table cells
@@ -650,6 +783,18 @@ _conn_epc():
   Instantiates EPC3004(port, id, baud, j_proxy=True), calls connect(), _resolve(), _read_device_ramp_rates().
   j_proxy=True enables Type C ↔ J-proxy conversion in all PV/SP reads and writes.
   Logged as "✓ EPC3004 on COMx". Accessible from Hardware menu or topbar "Connect All".
+
+PRESSBOX (class PressBox) — the Ion Gauge readout (self.ig_box, one instance):
+  Three stacked labels: title ("IG") / value (Courier New 14 bold, BL) / unit (Arial 8, DIM).
+  set_value(val):
+    None   → "N/A"      (DIM)
+    ≥1e3   → "OVER RNG" (RD)
+    else   → mantissa+exponent on the VALUE line, unit "Torr" on the line below:
+             f"{m:.2f}E{exp:+d}"  e.g.  9.20E-9 / 4.75E-11 / 7.50E+2
+  CHANGED 2026-09: was "9.20×10" on the value line with a tiny dim superscript
+    ("⁻⁹ Torr", Arial 8) underneath. The exponent is the number that actually matters
+    on a vacuum gauge (1e-6 vs 1e-9 is three decades), so it now renders at full
+    value-size and the unit drops to the small line.
 
 TEMPC PANEL (class TempCh) — per-channel control (used for HEAT3 CH1/CH2 and EPC3004 Indium):
   Rows: header (LED, state, name) | PV/SP boxes | Output % | divider
@@ -696,11 +841,23 @@ STATES: IDLE → RUNNING → PAUSED → DONE / ERROR
   param3: always None from GUI (Rate col removed 2026-05-09); load_excel() still parses old 6-col files
           and populates param3 for backward compat, but no action currently uses it
 
+DEVICE / CALLBACK ATTRIBUTES:
+  brax, heat3, shutter, indium  — assigned by gui_app._resolve()
+  bep                           — BEPManager, required by MEASURE_BEP (also set in _resolve)
+  on_step_change(int) / on_status_msg(str) / on_state_change(str)
+  on_bep_result(list)           — ONE call per MEASURE_BEP step with
+                                  [(BEPRecord, BEPTrace), …]. gui_app._wire() routes it to
+                                  rec_log.add_bep_measurement(). Deliberately per-STEP, not
+                                  per-source, so a "Both" sweep keeps In+Se on one sheet.
+
 CONTROL API:
   start()   clear _stop, _loop_counters; start _run thread
   pause()   clear _pause Event → _wait() blocks
   resume()  set _pause Event
-  stop()    set _stop + _pause; join thread 3s; state→IDLE
+  stop()    set _stop + _pause; ALSO calls bep.abort() (a MEASURE_BEP step blocks the
+            recipe thread inside the sweep — aborting closes the shutters and drops out
+            of the 20 Hz sampling loops so the 3 s join() can succeed); join thread 3s;
+            state→IDLE
   load_excel(path) → List[RecipeStep]
 
 _run() LOOP LOGIC:
@@ -742,6 +899,65 @@ RAMP_TEMP:
     toward target). Replaced with device-internal ramp to avoid setpoint churning and
     correctly match GUI behavior. Old 6-col recipes had (channel, target, rate) in
     (p1, p2, p3); new behavior ignores old p3 and uses p2 as the rate.
+
+INCREASE_TEMP:   (added 2026-09 — for flux-calibration staircases)
+  p1 = channel (Selenium/Substrate/Indium), p2 = Δ°C (negative steps down)
+  Reads the CURRENT SETPOINT, adds p2, writes it back via apply_setpoint:
+    Indium → indium.ch1_read_setpoint() (falls back to ch1_read_process_value())
+    HEAT3  → getattr(heat3, f"ch{ch}_read_setpoint") (falls back to the PV reader)
+  WHY SETPOINT-RELATIVE, NOT PV-RELATIVE: a calibration loop runs this once per pass;
+    stepping from the SP lands on exact repeatable temperatures, whereas stepping from
+    the live PV would accumulate drift every pass if the source has not fully settled.
+  Missing p2 → returns None (ERROR). Missing device → logs warning, returns 1 (skip).
+  Unreadable setpoint → returns None (ERROR) rather than guessing a base.
+
+MEASURE_BEP:     (added 2026-09)
+  p1 = "In" | "Se" | "Both"   (p2 unused)
+  if self.bep is None → logs warning, returns 1 (skip)
+  Calls bep.measure_sync(src, should_stop=lambda: self._stop.is_set()) — BLOCKS the
+    recipe thread for the whole sweep (~10 s per source, ~50 s for Both incl. settle),
+    which is the point: the next step must not start before the flux point is taken.
+  Logs each record, then fires on_bep_result([(rec, trace), …]) ONCE for the step.
+  Opens the shutter(s) it measures — do not place one inside a window where the
+    shutter must stay in a particular state.
+  Typical calibration pattern:
+    RAMP_TEMP → SET_TEMP → [WAIT_TEMP → MEASURE_BEP → INCREASE_TEMP → GOTO] → HEATER_OFF
+
+RHEED_VIDEO:     (added 2026-10-21 — roadmap R14)
+  p1 = clip length in seconds (0 = one still PNG); p2 unused. Missing/bad p1 → None (ERROR).
+  Calls the GUI hook engine.rheed_capture(duration, step_no, should_stop) — set by
+    MainWindow.__init__ to _rheed_recipe_capture. Hook None, or no camera connected on
+    the 📡 RHEED tab → logs ⚠ and returns 1 (SKIP — a missing camera never aborts a run).
+  BLOCKS the recipe thread for the clip (like WAIT_TIME): the recipe is paused at that
+    point with everything held; the preview timeline counts p1 seconds. Recipe Stop ends
+    the clip early (partial clip kept).
+  Uses the RHEED tab's CURRENT camera/source and its resolution/format ("the settings on
+    the RHEED tab"). Sample = the name given to the RUN (rec_log.sample_name), NOT the
+    RHEED tab's Sample box (user, 2026-10-21).
+  FILES  <LOG_ROOT>/rheed/<run name>/<sample>_Sub<T>C_SeIn<ratio>_rheed_<NNN>.avi|.png
+                                    + same-name .txt (metadata)
+    <run name> = rec_log.run_name = <run START stamp>_<sample> — the run .xlsx now uses
+      the same name (it was stamped at export time before).
+    T = last CH2 (substrate) PV from the DataLogger buffers at the clip start ("SubNA"
+      if none); ratio = bep.se_in_ratio, the LAST Se/In BEP measurement ("SeInNA").
+    NNN = per-run counter MainWindow._rheed_n (reset in _r_run) — counts up on every
+      execution, so GOTO loops give _001, _002, … and never overwrite.
+  RECORDING: rheed.capture.record_clip(source, path, duration, should_stop) — blocking,
+    MJPG .avi (as VideoRecorder), never raises. Written to the LOCAL disk
+    (<app>/logs/rheed/<run>/), then a "RHEED-move" thread copies to Box, verifies the
+    size and deletes the local copy; on failure the files stay local + ⚠ in the log.
+    (A ~12 MB/s stream written straight onto Box Drive could stall → dropped frames.)
+  METADATA .txt: sample, run, step, clip #, start/end (ms), length, camera (source,
+    WxH, codec, frames, measured fps, dropped), substrate T at start, Se/In ratio + In/Se
+    BEP, setpoints (Se CH1, Sub CH2, In EPC) + shutter states at start AND end, min /
+    mean / max per column over the clip, then the time series (DataLogger buffers,
+    ~4 Hz: Timestamp, Elapsed_s, IG_Pressure_Torr, CH1_Se_C, CH2_Sub_C, In_C) for
+    [first frame − 0.5 s, last frame + 0.5 s].
+  RUN LOG: rec_log.add_rheed_clip({...}) → sheet "RHEED clips" in the run .xlsx (#, step,
+    run elapsed, start, length, frames, Sub T, Se/In ratio, file, metadata, folder).
+  Tested 2026-10-21 (Test mode + simulated camera, offscreen): SET_TEMP → RHEED_VIDEO 3 →
+    WAIT 1 → GOTO 2 ×1 → RHEED_VIDEO 0 → END gave _001.avi (87 frames, 0 dropped),
+    _002.avi, _003.png + 3 .txt, all moved to Box, folder name = .xlsx name, sheet OK.
 
 WAIT_TEMP:
   p1 = channel name (e.g. "Selenium (CH1)", "Substrate (CH2)", "Indium (EPC)") OR legacy float
@@ -802,12 +1018,21 @@ DATA COLLECTIONS (lists of tuples):
   _rows_temp:      (timestamp_str, elapsed_s, ch1_c, ch2_c, in_c)   ← 5-element, in_c added
   _rows_shutter:   (timestamp_str, elapsed_s, in_open_01, se_open_01)
 
+  bep_runs:        one entry per in-recipe MEASURE_BEP step (added 2026-09):
+                   ([(BEPRecord, BEPTrace), …], elapsed_s)
+                   A "Both" sweep contributes ONE entry holding BOTH records.
+                   Cleared by start().
+
 API:
-  start(sample_name)  → starts bg thread, sets _start_time = time.time()
+  start(sample_name)  → starts bg thread, sets _start_time = time.time(), clears bep_runs
   stop()              → sets _stop Event, joins thread
+  add_bep_measurement(results)  → appends one MEASURE_BEP step's
+                        [(BEPRecord, BEPTrace), …] + elapsed. Called from the RECIPE
+                        thread via RecipeEngine.on_bep_result (list.append is atomic
+                        under the GIL; same pattern as the _rows_* collections).
   export_excel(dir)   → saves YYYYMMDD_HHMMSS_samplename.xlsx, returns path
 
-EXCEL EXPORT — 5 SHEETS:
+EXCEL EXPORT — 5 BASE SHEETS + N BEP SHEETS:
   Sheet "Run Info":       sample name, date, BEP data (incl. live In temp if EPC3004 used),
                           recipe table, temp chart
   Sheet "Pressure":       timestamped IG pressure + line chart
@@ -819,7 +1044,26 @@ EXCEL EXPORT — 5 SHEETS:
                            two separate line charts (In trace, Se trace).
                            Only present if bep_trace_in or bep_trace_se is not None.
 
+  Sheets "bep_measure_rec_1", "_2", … : ONE PER MEASURE_BEP STEP, in execution order
+                           (added 2026-09). Built from bep_runs.
+    A1  "BEP Measurement #i — In" / "— Se" / "— In + Se"
+    B2  run-elapsed seconds
+    Row 4+  summary blocks side by side, In in cols A/B, Se in cols D/E (same left/right
+            layout as BEP Fast Trace): header (Indium orange / Selenium purple), then
+            Source Temp °C, BEP, Peak (top-50% mean), Baseline — written as NUMBERS, not
+            preformatted strings — then Timestamp and Open window (s).
+    Row 12  trace tables: "In: Time (s)" | "In: Pressure (Torr)" | gap |
+            "Se: Time (s)" | "Se: Pressure (Torr)", full 20 Hz samples below.
+    Charts at G12 / G34 (one per source present).
+    A single-source step fills only its own block and draws one chart; the other
+    block stays empty.
+    WHY ONE SHEET PER STEP: a "Both" sweep is one measurement event. The callback is
+    fired once per STEP (not per source) precisely so In and Se share a sheet —
+    an earlier per-source callback produced rec_1=In, rec_2=Se for a single Both step.
+
   rec_log.bep_trace_in / rec_log.bep_trace_se: BEPTrace objects assigned in _r_run().
+  (These drive the single "BEP Fast Trace" sheet — the manual BEP tab measurement —
+   and are independent of bep_runs, which covers in-recipe MEASURE_BEP steps.)
   Data table at row 10: "In: Time (s)" | "In: Pressure (Torr)" | gap | "Se: Time (s)" | ...
   In chart at G10; Se chart at G30.
 
@@ -850,6 +1094,25 @@ CONSTANTS:
   BASELINE_DURATION = 8.0 s     (baseline averaging window)
   SETTLE_TIME       = 30.0 s    (post-In wait before Se measurement)
   TOP_FRACTION      = 0.5       (top 50% of open-window samples used for BEP mean)
+  NOTE: bep_manager.py imports ONLY stdlib (csv/os/time/threading/statistics/datetime/
+  typing), so recipe_editor.py safely imports these timing constants while staying
+  hardware-free. Keep it that way — adding a serial/PyQt import here would break the
+  standalone editor's build.
+
+ENTRY POINTS — two, with different threading models:
+  start_measurement()                     → spawns the "BEP" thread, runs _run()
+                                            (In → settle → Se). Used by the BEP tab.
+  measure_sync(source="Both", should_stop=None) → List[BEPRecord]   (added 2026-09)
+    Runs on the CALLING thread and BLOCKS. Used by the recipe engine's MEASURE_BEP so a
+    step waits for its flux point instead of racing past it.
+    source: "In" | "Se" | "Both" (anything unrecognised falls back to both).
+      Guard: a literal "Selenium" contains the substring "in", so the matcher explicitly
+      clears want_in when "selen" is present.
+    Skips with a log line when self.shutter is None, or when the async thread is live.
+    Clears _stop on entry; polls should_stop between phases; mid-sweep interruption goes
+    through abort() (which RecipeEngine.stop() calls).
+    Fires on_complete when it produced records, so the BEP tab plots refresh.
+  trace_for(source) → BEPTrace | None     — latest trace_in / trace_se by name.
 
 MEASUREMENT SEQUENCE:
   Phase          Duration  Sampling  Action
@@ -945,13 +1208,15 @@ PRIMARY API:
   feed(pressure, ch1_t, ch2_t, in_t=None)  ← called by Poller._loop after each hardware read
     in_t: Indium temperature from EPC3004 (None if not connected)
     - appends absolute (time.time(), value) tuples to all three buffers
-    - writes one CSV row if running (self._fh is open)
+    - if running: QUEUES one CSV row (no file I/O on the Poller thread since v3)
     - calls on_data callback if set
     - thread-safe via self._lock
 
-  start_logging(log_path=None)   opens logs/pressure_log_YYYYMMDD_HHMMSS.csv;
-                                  does NOT start any thread
-  stop_logging()                 flushes + closes CSV
+  start_logging(log_path=None)   starts the "DataLogger-writer" thread, which opens
+                                  <LOG_ROOT>/system/pressure_log_YYYYMMDD_HHMMSS.csv
+  stop_logging()                 writer drains the queue, flushes, closes (join ≤ 10 s)
+  pop_notes()                    writer warnings (Box stall, fallback) — GUI logs them
+                                  every 2 s (MainWindow._logger_notes)
 
 READ API:
   get_pressure_history()  → (t_list, p_list)    t values are absolute Unix floats
@@ -961,9 +1226,14 @@ READ API:
   _buf_to_lists(buf)      → returns [p[0] for p in pts], [p[1] for p in pts]
                             (absolute timestamps — callers use DateAxisItem)
 
-CSV FILE: logs/pressure_log_YYYYMMDD_HHMMSS.csv
+CSV FILE: <LOG_ROOT>/system/pressure_log_YYYYMMDD_HHMMSS.csv
   Columns: Timestamp, IG_Pressure_Torr, CH1_Temp_C, CH2_Temp_C, In_Temp_C
-  Line-buffered (buffering=1), written in Poller thread context
+  v3 (2026-10-21): written by the WRITER THREAD in ≤ 1 s batches + flush, NOT in the
+  Poller thread. Reason: the file is on Box Drive (cloud-backed virtual drive) whose
+  writes can stall / hit a briefly locked file during upload — in the Poller thread
+  that would freeze hardware polling. OSError → reopen + retry every 2 s; failing
+  > 20 s → continue in <app>/logs/system/ (rows stay queued, none lost). Tested: a
+  never-writable path → feed() ≤ 0.3 ms, fallback, 150/150 rows kept, one warning.
 
 ATTRIBUTES:
   self.log_file_path  = current CSV path or None
@@ -1327,6 +1597,20 @@ RECIPE PARAM CONVENTIONS:
   Param2 for RAMP_TEMP: float (°C/min — device-internal ramp rate to set)
   Param2 for WAIT_TEMP: float (tolerance °C, default 2.5)
 
+MOUSE WHEEL NEVER CHANGES INPUTS (wheel_guard.py, 2026-10-06, user request):
+  Scrolling past a spin box / dropdown / slider used to change its value. Every entry
+  point calls wheel_guard.install(app) right after apply_dark_theme(app) — main.py,
+  recipe_editor.py, rheed_app.py. ONE app-wide event filter: wheel events on
+  QAbstractSpinBox / QComboBox / QSlider are swallowed and a copy is sent to the
+  viewport of the nearest enclosing QAbstractScrollArea (scroll area, table, list), so
+  the page/table still scrolls. Values change only by typing, arrows, keyboard or the
+  opened dropdown list. NOT blocked: scroll bars, pyqtgraph plots (wheel = zoom), tab
+  bars. Covers widgets created later (table cell editors, dialogs, embedded RHEED tab)
+  — no per-widget code needed; a NEW entry point must call install() too.
+  Gotcha found while testing: re-sending the wheel event to the PARENT widget does not
+  scroll — Qt propagates only spontaneous (hardware) wheel events up the parent chain.
+  wheel_guard.py imports PyQt5 only, so the lean Recipe Editor exe stays OpenCV-free.
+
 COLOR CONSTANTS IN GUI (dark theme):
   BG="#1e1e2e", PBG="#2a2a3e", BDR="#44446a"
   BL="#5e9cf3" (blue), GR="#50fa7b" (green), RD="#ff5555" (red)
@@ -1339,10 +1623,31 @@ CHANNEL COLORS:
   Substrate (CH2) = PU (purple, #bd93f9)
   Indium (EPC3004) = IN_C (cyan, #8be9fd)
 
-OUTPUT FILES LOCATION: logs/ subfolder of vac_control/ (auto-created)
-  logs/pressure_log_YYYYMMDD_HHMMSS.csv     live log (DataLogger)
-  logs/YYYYMMDD_HHMMSS_samplename.xlsx      run log  (RecipeLogger)
-  recipes/bep_log.csv                        BEP history (appended, not in logs/)
+LOG LOCATIONS (log_paths.py, user request 2026-10-21) — separate system / deposition:
+  LOG_ROOT = ~/Box/logs  (C:\Users\<logged-in user>\Box\logs — Box Drive's mount, so
+             it works on every lab PC) — ONLY if ~/Box exists and system/ + deposition/
+             are writable; never creates a fake Box folder. Else <app folder>/logs
+             (frozen exe: the .exe's folder, not PyInstaller's temp _MEIPASS).
+             Override: env VAC_LOG_ROOT. The GUI logs the choice at startup ("📁 …").
+  <LOG_ROOT>/system/      pressure_log_*.csv (DataLogger), ln2_history.csv (LN2Monitor),
+                          bep_log.csv (BEP history — bep_manager.BEP_CSV_FILE is set by
+                          gui_app). Old project files are COPIED once on first start
+                          (log_paths.system_file(name, legacy=…)) so histories continue;
+                          the originals stay where they were.
+  <LOG_ROOT>/deposition/  YYYYMMDD_HHMMSS_<sample>.xlsx run logs. _export_run_log(): wb.save
+                          used to raise uncaught in a plain thread if the target failed →
+                          the run log was LOST silently; now falls back to
+                          <app>/logs/deposition and logs a warning ("copy it to Box").
+  <LOG_ROOT>/rheed/       RHEED snapshots, rotation keyframes, tracking CSVs, video-analysis
+                          exports (all only when the user saves/captures).
+  <LOG_ROOT>/rheed/<run name>/  RHEED_VIDEO recipe clips + metadata (Section 6); <run
+                          name> = the run .xlsx name in deposition/. Raw ⏺ video
+                          recordings (~12 MB/s) stay LOCAL: <app>/logs/rheed/videos.
+  Lab Box folder seen 2026-10-21: C:\Users\fmammo3\Box\logs already held BDEP171–175
+    .xlsx copied by hand into its root — left there; new runs go to deposition/.
+  RULE: no file I/O on a hardware/Poller thread when the target may be on Box — queue it
+    to a writer thread (DataLogger v3). Messages from plain threads → pyqtSignal
+    (_LogBridge, self._logb — NOT self._lb, which is the LN2 bridge).
 
 ================================================================================
 SECTION 13: HARDWARE WIRING DEFAULTS (configurable in Settings)
@@ -1350,15 +1655,22 @@ SECTION 13: HARDWARE WIRING DEFAULTS (configurable in Settings)
 
   Device          Default COM   Baud    Protocol
   ─────────────────────────────────────────────────────────────
-  HEAT3           COM12         19200   Modbus RTU, Slave 1  (was COM3/57600)
-  B-RAX 3400      COM11         19200   InstruTech RS-485 ASCII, Addr 01
-                  (Prolific PL2303GT USB-RS485 adapter confirmed on COM11)
-  Arduino Uno     COM7          9600    Serial ASCII + \n terminator
-  EPC3004         COM13         19200   Modbus RTU, Slave 1  (Indium source)
+  B-RAX 3400      COM3          19200   InstruTech RS-485 ASCII, Addr 01
+  HEAT3           COM6          19200   Modbus RTU, Slave 1
+  Arduino Uno     COM5          9600    Serial ASCII + \n terminator
+  EPC3004         COM7          19200   Modbus RTU, Slave 1  (Indium source)
   Poll interval   0.25 s default (configurable in Settings, range 0.10–30.00 s)
 
-  NOTE: COM ports hardcoded in DCFG dict and Settings dialog fallbacks (gui_app.py).
-  These are the actual lab port assignments as of 2026-05-09 (EPC3004 COM13 TBC).
+  2026-10-21 (user): defaults are COM3, COM6, COM5, COM7 = the top bar's port boxes
+    LEFT → RIGHT (BRAX, HEAT3, Arduino, EPC3004). Previous confirmed assignments
+    (2026-05-09): BRAX COM11 (Prolific PL2303GT), HEAT3 COM12, Arduino COM7, EPC3004
+    COM13 — replaced; the adapters / PC changed.
+  NOTE: COM ports hardcoded in DCFG dict and Settings dialog fallbacks (gui_app.py);
+    NOT persisted — every launch starts on these.
+  Port dropdowns have a tooltip per entry = pyserial's description (port_descriptions()),
+    so a wrong pick is visible. On the dev laptop (no tools attached) COM3 = Intel AMT
+    Serial-over-LAN and COM4/5/6/10 = Bluetooth serial links — opening a Bluetooth COM
+    can hang for seconds. The 3/6/5/7 defaults are for the LAB PC.
 
 ================================================================================
 SECTION 14: DIAGNOSTICS TOOLS (diagnostics/)
@@ -1434,13 +1746,30 @@ configure_epc3004_cstm1.py — EPC3004 TYPE C TC SETUP (J-PROXY METHOD)
 SECTION 15: HOW TO ADD A NEW RECIPE ACTION
 ================================================================================
 
-1. Add to ALL_ACTIONS list in gui_app.py
-2. If it needs a channel dropdown: add to ACTION_CH_OPTS
-3. If it needs a source dropdown: add to ACTION_SHUTTER_OPTS
-4. Add elif branch in RecipeEngine._exec() returning 1 (or 2/None/-1)
-5. Update _simulate_recipe_timeline() in gui_app.py for recipe preview plot behaviour
+*** DO ALL OF THESE IN BOTH gui_app.py AND recipe_editor.py — the action constants and
+    the timeline simulation are deliberately duplicated so the standalone editor needs no
+    hardware imports. They are only in sync because every change touches both. ***
+
+1. Add to ALL_ACTIONS list in gui_app.py          AND recipe_editor.py
+2. If it needs a channel dropdown: ACTION_CH_OPTS      (both files)
+3. If it needs a source dropdown:  ACTION_SHUTTER_OPTS (both files)
+4. Add elif branch in RecipeEngine._exec() returning 1 (or 2/None/-1).
+   Guard every device it touches: `if not self.heat3: log+return 1` (skip, not error).
+   Missing REQUIRED params → return None (ERROR).
+5. Update the timeline simulation for the preview plot, in BOTH
+   gui_app.MainWindow._simulate_recipe_timeline() and
+   recipe_editor.simulate_recipe_timeline().
+   If the action needs its own overlay, append to a new/existing region list — and
+   remember to rescale it inside stretch() or it will not follow a GOTO loop.
+   If it changes the returned tuple's arity, update BOTH _refresh_recipe_preview()
+   unpackings (gui_app uses index [0] in _r_run, which is arity-safe).
 6. Add to Section 6 (ACTION IMPLEMENTATIONS) of this CONTEXT.txt
-7. Test headlessly: python test_recipe.py (mock serial, mock modbus)
+7. Test headlessly — NOTE test_recipe.py is currently broken (hardcoded Linux path).
+   Practical approach used in 2026-09: drive RecipeEngine._exec() directly against
+   devices/sim_devices.py instances and assert on the sim setpoints, and call the
+   timeline sim directly to assert durations. Both run fine under the Anaconda env
+   (PyQt5 + pyqtgraph + openpyxl present; pyserial present; minimalmodbus is NOT
+   installed and is NOT actually imported anywhere — it is a stale build.spec entry).
 
 ================================================================================
 SECTION 15: PERFORMANCE TUNING
@@ -1628,16 +1957,826 @@ SECTION 17: HOW TO ADD A NEW HARDWARE DEVICE
 6. Add to closeEvent cleanup
 7. Wire status LED in _build_left()
 
+================================================================================
+SECTION 18: LN2 DEWAR LEVEL MONITOR (devices/ln2_monitor.py)
+================================================================================
+
+PURPOSE: Track liquid nitrogen level for the deposition system's LN2 dewar.
+  LN2 is required for deposition; running out mid-recipe is a real failure
+  mode, so this gives an always-visible fill/trend indicator in the GUI
+  rather than requiring a manual portal check.
+
+DATA SOURCE: Air Products APDirect portal
+  https://apdirect.airproducts.com/Tanks/Readings/52228   (tank ID 52228)
+  CONFIRMED (2026-08-12) via a user-supplied browser DevTools HAR capture,
+  read only through a redaction script that blanked every password/token/
+  cookie value before any of it reached the assistant — see "HAR HANDLING"
+  below. apdirect.airproducts.com is an Angular SPA; the reading is not in
+  static HTML, it comes from a JSON API called after login. STATUS: scraper
+  IS implemented (devices/ln2_monitor.py, _do_fetch()). Confirmed flow:
+    1. GET  account.airproducts.com/login?ReturnUrl=.../Tanks/
+       -> scrape __RequestVerificationToken hidden input from the HTML.
+    2. POST same URL, form-encoded: username, Password, password (both
+       cased variants — the real form posts both), __RequestVerificationToken.
+       Success = 302 off the login page. Session auth is cookie-based
+       (requests.Session() persists cookies automatically; no bearer token).
+    3. GET  apdirect.airproducts.com/Tanks/API/v1/ShipToList
+       -> JSON: list of ship-tos, each with logicalAssets[] containing
+          logicalAssetId, lastReading{value,dateTime,uom}, fullValue,
+          fullUOM, logicalChannels[{logicalChannelId}]. This alone gives
+          the current reading AND the tank's true full-scale value —
+          tank 52228's confirmed fullValue is 46 (unit "IN"), NOT the
+          120 originally guessed before the HAR was captured.
+    4. GET  apdirect.airproducts.com/Tanks/API/v1/GetEquipmentReadings
+          ?logicalChannelId=<id>&from=<iso>&to=<iso>&companyKey=<..>&
+           countryCode=<..>&shipToType=<..>
+       -> JSON: d.readings[] history array for that channel; used to
+          backfill up to BACKFILL_DAYS (30) of trend data in one call
+          instead of waiting on twice-daily polling to fill the plot.
+          _merge_history() dedups by timestamp so repeated backfills
+          (every scheduled check) don't re-append the same rows forever.
+  Real reading confirmed via the HAR (2026-08-12T15:00 local): tank 52228
+  was at 4 in of 46 in full scale — i.e. genuinely near-empty at capture
+  time, well under LOW_LEVEL_IN (20).
+  fetch() still fails safely at any step (bad credentials, page layout
+  change, network error, tank not found in ShipToList) — the GUI falls
+  back to its stale ("no recent reading") yellow state rather than crashing
+  or fabricating a value.
+
+  HAR HANDLING (how the flow above was learned without exposing the
+  password): the user supplied apdirect.airproducts.com.har directly in
+  their project folder. It was never opened with a general-purpose file
+  read. Instead, a one-off script (devices/ln2_monitor.py's flow was
+  reverse-engineered from a REDACTED summary) parsed the HAR and blanked
+  any JSON key / form field / header matching password|pwd|secret|token|
+  auth|credential|apikey|key|ssn (case-insensitive, recursively) plus all
+  cookies wholesale, BEFORE writing a summary file — only that redacted
+  summary was ever read. A follow-up grep for "password"/"pwd" on the
+  redacted summary confirmed every match resolved to "<REDACTED>" before
+  it was read. The raw .har file itself still contains the real plaintext
+  password (HAR captures raw POST bodies) and was flagged to the user as
+  a standalone risk — see the 2026-08-12 changelog entry for the outcome.
+
+CREDENTIALS — ENCRYPTED, NEVER IN CHAT/CODE/LOGS:
+  Storage: secrets/ln2_creds.dat (gitignored), Windows DPAPI-encrypted
+    (ctypes calls to CryptProtectData/CryptUnprotectData — no extra
+    dependency). DPAPI ties the ciphertext to the current Windows user
+    account + machine; it cannot be decrypted elsewhere.
+  Setup: tools/setup_ln2_credentials.py — run manually by the user in their
+    own interactive terminal (getpass hidden input). Never run through
+    Claude/automation — that is what keeps the plaintext password from ever
+    appearing in a transcript or log. Re-run it any time to rotate creds.
+  Runtime: LN2Monitor._load_credentials() decrypts to memory only for the
+    duration of one fetch() call; no method returns, logs, or prints the
+    plaintext username/password.
+
+LN2Reading dataclass: timestamp (unix float), level_in (float, inches),
+  raw (optional dict for future fields once the JSON shape is known).
+
+LN2Monitor API (devices/ln2_monitor.py):
+  credentials_configured() -> bool
+  fetch() -> LN2Reading|None      blocking network I/O — call from a bg thread only.
+                                  Re-entrancy-guarded (_fetch_lock) — an overlapping
+                                  call is a safe no-op, not queued or errored.
+                                  Updates last_reading/last_attempt_ok/last_error,
+                                  merges successful reads (+ any backfilled history)
+                                  into logs/ln2_history.csv via _merge_history() (dedups
+                                  by timestamp), and invokes on_reading(reading|None, ok).
+  history(hours=None) -> (t_list, level_list)   absolute Unix timestamps, from CSV
+  is_stale(stale_hours=STALE_HOURS) -> bool     True if no successful reading within window
+  is_low(low_in=LOW_LEVEL_IN) -> bool
+  last_read_str() -> str          "never" or "YYYY-MM-DD HH:MM:SS"
+  full_scale_for(reading=None, default=FULL_SCALE_IN) -> float
+                                  Prefers the live fullValue from reading.raw (set by
+                                  _do_fetch() from the ShipToList API response) over the
+                                  FULL_SCALE_IN fallback constant. GUI calls this instead
+                                  of using FULL_SCALE_IN directly, so the fill-bar 100%
+                                  reference is always the tank's real full-scale value
+                                  once at least one live reading has been fetched.
+  start_scheduler() / stop_scheduler()   background thread, checks CHECK_TIMES daily
+                                  (default 08:00 / 20:00 local) + one catch-up fetch
+                                  on startup if the loaded history is already stale.
+  on_reading: callable(reading|None, ok: bool)|None
+                                  invoked from whichever thread performed the fetch
+                                  (scheduler thread or manual-refresh thread) — GUI
+                                  MUST bridge to the main thread via pyqtSignal
+                                  (see _LN2Bridge in gui_app.py; BUG 7/20 pattern —
+                                  QTimer.singleShot from a plain thread is unreliable).
+
+CONSTANTS (devices/ln2_monitor.py, top of file):
+  CHECK_TIMES   = [08:00, 20:00]   automatic scheduled check times (local time)
+  STALE_HOURS   = 18.0             dewar shown yellow past this many hours since last read
+  LOW_LEVEL_IN  = 20.0             dewar shown red at/below this level (inches)
+  FULL_SCALE_IN = 46.0             fallback fill-bar 100% reference (= tank 52228's
+                                    confirmed fullValue from the ShipToList API); only
+                                    used when full_scale_for() has no live reading yet
+
+SCHEDULING MODE: in-app only (QTimer/threading inside the running GUI process).
+  Twice-daily checks only happen while VacDepositionControl is open — there is
+  no Windows Scheduled Task. If the app is closed at a scheduled check time,
+  that check is simply skipped until the next app launch (startup catch-up
+  fetch) or the next scheduled time while running. (Chosen deliberately over
+  a Task Scheduler-based always-on checker — 2026-08-12.)
+
+GUI INTEGRATION (gui_app.py):
+  LN2_C="#8ecae6" (sky blue, LN2 accent), YL="#f1fa8c" (yellow, stale highlight — reused
+  from the existing Dracula-yellow active-recipe-row text color).
+  DewarFillWidget(QWidget): custom-painted vertical capsule, filled bottom-up by
+    level_in/FULL_SCALE_IN. Border/fill color: LN2_C (ok) / YL (stale) / RD (low).
+  LN2Panel(QFrame): DewarFillWidget + pyqtgraph time-series (scatter+line, DateAxisItem,
+    last 7 days from history()) + "Last read: <timestamp>" footer + "⟳" refresh button
+    (refresh_clicked signal). Placed in the left status panel via _ln2_grp(), after
+    _shutter_grp(), inside a QGroupBox("LN2 Supply").
+  Precedence when both apply: level ≤ LOW_LEVEL_IN (red) takes priority over stale
+    (yellow) — a known-low last reading is the more urgent signal even if it's old.
+  _LN2Bridge(QObject): pyqtSignal(object, bool) reading_updated — wired in _wire().
+  _refresh_ln2_display(): repaints panel from LN2Monitor's current state; called after
+    every fetch (via _on_ln2_reading) and every 60 s by self._lt QTimer (no I/O — just
+    re-evaluates is_stale() so the yellow state advances even without a new reading).
+  _ln2_refresh(): manual refresh button handler — fire-and-forget daemon thread calling
+    self.ln2.fetch(), consistent with the IG ON/OFF and shutter button pattern.
+  MainWindow.ln2 constructed before _build() (widgets read its loaded-from-history state
+    immediately); self.ln2.start_scheduler() called after self.poller.start()/_timers();
+    self.ln2.stop_scheduler() added to closeEvent().
+
+DATA FILE: logs/ln2_history.csv (gitignored via logs/ rule)
+  Columns: Unix_Timestamp, Level_In, Timestamp_Str. Append-only; loaded on startup so
+  the trend plot and last-known level survive an app restart even with no network.
+
+================================================================================
+SECTION 19: STANDALONE RECIPE EDITOR (recipe_editor.py)   [added 2026-09]
+================================================================================
+
+PURPOSE: let lab members write and validate recipes ahead of time on their own PC,
+with no vacuum system, no pyserial/Modbus, and no Python install (shipped as an .exe).
+Output is byte-identical to what the Recipe tab saves, so files move both ways.
+
+ENTRY:  python recipe_editor.py
+BUILD:  pyinstaller recipe_editor.spec → dist/RecipeEditor/RecipeEditor.exe
+        Ship the WHOLE dist/RecipeEditor folder (one-folder build), zipped ≈69 MB.
+
+DEPENDENCIES: PyQt5, pyqtgraph (optional — HAS_PG guard), openpyxl. NOTHING ELSE.
+  Imports from the project: recipe_engine (RecipeEngine.load_excel / _src_to_ch /
+  _is_indium_src) and bep_manager (timing constants only). Both are stdlib-only
+  modules — it must NEVER import gui_app or devices/, or the hardware-free promise
+  and the small build both break.
+
+WHAT IT SHARES WITH THE RECIPE TAB (duplicated code — keep in sync, see Section 15):
+  ALL_ACTIONS / ACTION_CH_OPTS / ACTION_SHUTTER_OPTS
+  RecipeTable (drag-drop row reorder via row_moved signal)
+  the timeline simulation + every preview overlay, incl. the GOTO stretch and BEP bands
+  the 5-column save format and the Column Guide text
+
+WHAT IT ADDS BEYOND THE RECIPE TAB:
+  New / Save / Save As + dirty tracking (window title shows " *"), prompt-on-discard
+    for New / Open / window close.  (The runner has New + Save As too, but no dirty flag.)
+  ▲ Up / ▼ Down buttons (the runner relies on drag-drop alone).
+    NOTE _on_row_moved uses drag-drop "insert before" indices, so moving DOWN one row
+    needs dst = src + 2, not src + 1.
+  self._loading guard so populating the table does not mark the doc dirty.
+
+WHAT IT DELIBERATELY OMITS: Run / Pause / Stop, run progress, hardware panels, logging.
+
+BUILD GOTCHAS (Anaconda + PyInstaller — all handled inside recipe_editor.spec):
+  1. Anaconda ships several stdlib extension modules linked against DLLs in
+     <sys.prefix>/Library/bin, which PyInstaller does NOT search. Without them the exe
+     builds cleanly and then dies on launch with "DLL load failed while importing
+     pyexpat" / "_ctypes" / "QtCore". The spec globs Library/bin for
+     libexpat*, ffi*, sqlite3*, libbz2*, liblzma* and the three conda-renamed Qt libs
+     (Qt5Core_conda.dll / Qt5Gui_conda.dll / Qt5Widgets_conda.dll).
+     Guarded by os.path.isdir() so a plain python.org build is unaffected.
+     Do NOT bulk-add every *_conda.dll: that set is ~170 MB and includes a 112 MB
+     unused WebEngine library.
+  2. pyqtgraph's PyInstaller hook collects all its submodules, including optional
+     exporters that probe for numba/scipy/h5py/matplotlib. In a conda base env those
+     exist, so ~190 MB of unrelated packages get pulled in. The spec's excludes list
+     kills them (345 MB → 178 MB unzipped).
+  3. Smoke-test the built .exe, not just `python recipe_editor.py` — every failure
+     above only appears in the frozen binary.
+
+================================================================================
+SECTION 20: RHEED CAMERA, CAPTURE & ANALYSIS (rheed/)   [added 2026-10-01]
+================================================================================
+
+PURPOSE: live RHEED view, snapshots/video, and RHEED analysis — first feature is
+rotation-synchronised capture (keep the frames at the good azimuths of a rotating
+substrate, discard the rest). Grows into RHEED oscillations + crystal
+characterisation (roadmap below). STANDALONE today (rheed_app.py); built to become a
+tab of the main controller with ~3 lines (see INTEGRATION).
+
+HARDWARE PATH:
+  Canon EOS 90D → HDMI out (mini/micro HDMI) → HDMI-to-USB capture device → laptop USB-C.
+  The capture device is a UVC "webcam" → read with cv2.VideoCapture(index, CAP_DSHOW).
+  No Canon SDK / EOS Webcam Utility involved.
+  Devices Windows has seen before on the lab laptop (Get-PnpDevice, 2026-10-01; NOT
+  connected at that time, so nothing below is hardware-verified yet):
+    "0A29-INOGENI 4KXPLUS"  (Camera class, USB\VID_2997&PID_001F) — USB-3 HDMI capture box
+    "USB C Video Adaptor"   (USB\VID_25A4&PID_9311) — unknown: may be a capture dongle
+                             OR a USB-C→HDMI *display* adapter (output only)
+  Index 0 is the laptop's built-in webcam (640×480) — the capture device is ≥1.
+  ACTUAL LAB LAPTOP (probed 2026-10-07, camera connected for the first time):
+    [0] laptop webcam (Realtek USB\VID_0BDA&PID_5587) — 1920×1080 YUY2 ~20 fps; showed
+        the "camera off" icon (privacy shutter closed)
+    [1] "EOS Webcam Utility" (Canon's USB software webcam, ROOT\EOSWEBCAMSOURCE) — max
+        1280×720; shows its own "USB not connected" card when no camera is on USB
+    [2] "Guermok USB3 Video" (USB\VID_345F&PID_2130 — the HDMI→USB grabber, THE RHEED
+        PATH) — 1920×1080 @ 30 fps in Auto / MJPG / YUY2 (delivers YUY2 regardless);
+        asking 3840×2160 gives 2560×1600. Shows its own "GUERMOK  No Video" card when no
+        HDMI signal arrives — NOT dark (std ≈ 21), so the dark flag does not catch it.
+    one more DirectShow device raised "pVih" in videoInput::start (format negotiation
+      — likely a Windows Studio Effects virtual camera, or the device the running app held).
+    (The INOGENI / "USB C Video Adaptor" listed above are NOT what is in use.)
+  USER REPORT "640×480": the Source dropdown showed each device's IDLE size from the
+    scan (e.g. "[2] Camera 2 (640×480)") — misleading; removed 2026-10-07. The delivered
+    size is in the status bar after Connect; it turns ORANGE and a ⚠ is logged when the
+    device delivers a different size than requested (wrong device or Format MJPG).
+  Canon 90D: if it is connected by USB to the EOS Webcam Utility, use the HDMI path
+    instead (USB webcam ≤ 1280×720, compressed); clean HDMI output as noted below.
+  CAMERA SETTINGS: HDMI info display OFF ("clean HDMI") or the overlay is burned into
+    every frame; auto power-off disabled; manual exposure (auto-exposure on a RHEED
+    screen pumps brightness as streaks rotate in/out and corrupts quality scores).
+  CONNECTING (known setup, 2026-10-07): RHEED app → 🔍 Scan → Source [2] (Guermok) →
+    Res 1920×1080, Format Auto → Connect. Status bar must read 1920×1080 ~30 fps (orange
+    = the device delivered a different size than requested). A "GUERMOK No Video"
+    picture = no HDMI signal from the 90D (live view / movie mode, cable, clean HDMI;
+    unplug the Canon's USB if EOS Webcam Utility is using it).
+  PROBE (new device, or indices changed): python diagnostics/rheed_camera_probe.py,
+    then --index N — confirms index, which resolution/FOURCC the device accepts
+    (USB-2 dongles typically need MJPG for 1080p30), and saves test frames to
+    logs/rheed/probe/ (look at them to tell the devices apart: each placeholder card
+    names its device). CLOSE the RHEED app first — a device it holds can't be probed
+    (DirectShow "can't capture by index" / pVih errors).
+
+ARCHITECTURE (rheed/ never imports gui_app or devices/ — like recipe_editor):
+  camera.py   _FrameSource base: ONE capture thread per source, never raises after start().
+                state: IDLE / CONNECTING / CONNECTED / DISCONNECTED (+ .message, .fps,
+                .resolution, .dark).
+                Open fails / device unplugged (READ_FAIL_LIMIT=15 consecutive bad reads)
+                → DISCONNECTED, release, retry every RECONNECT_INTERVAL=2 s, resume alone.
+                open() requires an actual first frame (isOpened() accepts phantom devices).
+                .dark = frame std < DARK_STD(2.0): no HDMI signal / camera asleep / beam
+                off. A FLAG, not a disconnect — a dark screen is a legitimate RHEED state.
+              Consumers: latest() → newest Frame (GUI polls), subscribe(maxsize) →
+                FrameQueue of every frame; a slow consumer DROPS frames (counted in
+                q.dropped) instead of blocking capture.
+              Frame(image BGR uint8 — read-only/shared, t=time.time(), index)
+              RHEEDCamera(index, backend="dshow", width, height, fps, fourcc=None|MJPG|YUY2)
+              SimRHEEDCamera(rpm=10) — synthetic 4-fold surface (render_sim_pattern):
+                sharp streak family at 0/90/180/270°, weaker √2-spaced family at 45°…,
+                moving diffuse spots off-azimuth, and a sin(φ) specular wobble so the
+                true 360° period repeats exactly but the 90° sub-period only nearly
+                (like a real wobbling holder). Used for test mode and all tests below.
+              list_cameras(max_index=6, skip=()) — probes DSHOW indices (~0.5–1 s each,
+                run on a thread); names via optional pygrabber, else "Camera N".
+              OPENCV_LOG_LEVEL=ERROR is set before cv2's first import (camera.py) —
+                otherwise the 2 s reconnect loop prints a DSHOW warning every retry.
+                (cv2.utils.logging does NOT exist in the opencv-python wheels.)
+  rotation.py Pure numpy (cv2 only for resize). See ALGORITHM.
+  capture.py  save_snapshot(), VideoRecorder (MJPG .avi until stop), RotationCapture.
+              Callbacks fire on WORKER threads → GUI bridges via pyqtSignal.
+  rheed_tab.py RHEEDTab(QWidget). Polls the source with QTimers (_view_t 50 ms → image,
+              _stat_t 250 ms → LED/state/fps/buttons); worker callbacks re-emitted via
+              _Bridge pyqtSignals (BUG 7/20 rule — no QTimer.singleShot from threads).
+              Display is downsampled 2× above 1600 px wide; captures stay full-res.
+              ImageItem.setRect maps the display to FULL-RES pixel coords, so the ROI
+              (pg.RectROI, yellow) is read directly in camera pixels.
+
+ROTATION-SYNC ALGORITHM (rotation.analyze_rotation):
+  1. Per frame: 128-px-wide grey thumbnail (make_thumb, optional ROI) + quality score.
+     Streak ORIENTATION (added 2026-10-06): orientation="auto"|"vertical"|"horizontal".
+     Auto (streak_orientation) = the profile direction whose per-frame score has the
+     larger coefficient of variation (the right one swings with rotation; the wrong one
+     is dominated by the static screen rim / shadow edge). Both CV < 0.03 → vertical.
+  2. Subtract the clip's MEAN thumbnail (static shadow edge / glow otherwise make all
+     frames look alike), then TEMPORAL HIGH-PASS (added 2026-10-06): subtract a moving
+     mean over detrend_s (auto = 1.5×expected_period, else clip/2; 0 = off) — removes
+     slow beam/glow drift, which on MVI_2527 dominated the raw correlation. The window
+     MUST stay longer than the period: 1 s on the 4-fold sim locked T/4, 20–30 s on
+     MVI_2527 locked T/5 (it strips the once-per-rev content that separates T from
+     its symmetry sub-period). L2-normalise → correlation matrix C = X·Xᵀ.
+  3. Self-similarity vs lag: mean C over all pairs binned by their TIMESTAMP difference
+     (bin = median frame interval). Timestamps, not indices → dropped frames are harmless.
+  4. Period: search lags ≥ first local minimum (skip the trivial short-lag peak) up to
+     0.85×clip; take the EARLIEST local peak ≥ HARMONIC_TOL(0.90)×best peak (otherwise
+     2T can beat T on noise — seen in testing at 7.3 rpm), parabolic sub-bin refine.
+     expected_period (from the rpm box) narrows the search to ±25 %. If the peak lands
+     on the window's upper edge → .warning "clip probably too short for this rpm"
+     (lags only reach 0.85 × clip; e.g. 110 s of MVI_2527 at 0.62 rpm read 88.5 s).
+     peak < MIN_CONF(0.25) → "no rotation" → keep the top-quality frames instead.
+     fold: equal peaks at every k·T/n (n∈6,4,3,2) → reported "n-fold pattern symmetry".
+  5. azimuth_i = 360·((t_i−t0) mod T)/T  — RELATIVE to the clip's first frame (no encoder).
+  6. Quality = std of the high-passed profile across the streaks (column means for
+     vertical streaks, row means for horizontal) = "streak contrast". Binned to 5° (72 bins), circular 1-2-1 smoothing; the top
+     n_picks local maxima ≥ 20° apart are kept. Per pick: best frame (max quality
+     within ±1 bin) + one frame per revolution within ±1 frame of rotation (members).
+  KNOWN LIMIT: a clip SHORTER than one true revolution can only reveal the symmetry
+    sub-period (90° on 4-fold) → rpm reads n× high. Without an rpm entered, the result
+    carries .warning saying so; the GUI auto-lengthens the clip to ≥2.5 revs when an rpm
+    is typed. Real-substrate behaviour (growth drift, wobble, exposure) NOT yet verified.
+  VALIDATED (synthetic, 10 % random drops + 4 ms jitter): 3–15 rpm → period error
+    ≤0.22 %, picks within ~1–2° of truth; static substrate → "no rotation"; analysis of
+    600 frames ≈ 0.06 s.
+
+ROTATIONCAPTURE PIPELINE (capture.py) — "short clip → keep good frames → delete clip":
+  RECORD   frames → temp .avi in tempfile.gettempdir() (NOT the OneDrive project folder:
+           it would start syncing hundreds of MB) + thumbnail/timestamp per frame in RAM
+           (~30 MB for 20 s @ 30 fps). Stall > STALL_TIMEOUT(3 s) = camera lost →
+           analyse the partial clip.
+  ANALYSE  analyze_rotation(times, thumbs, expected_period=60/rpm, n_picks).
+  EXTRACT  one sequential read of the clip: per pick, best frame + float mean of members.
+  CLEAN UP temp clip deleted in a finally (moved to clip.avi if keep_video).
+  Never raises: any exception → on_done(None, "capture failed: …").
+  TEMP CODEC (benchmarked 2026-10-01, opencv 4.10, 1080p):
+    MJPG via cv2.CAP_OPENCV_MJPEG (default): ~75 fps encode, 0.42 MB/frame, mean error
+      1.6 grey levels (below camera noise). VIDEOWRITER_PROP_QUALITY has NO effect
+      (90/95/100 identical output).
+    FFV1 lossless (opt-in checkbox): only ~10 fps at 1080p, 2.6 MB/frame → most frames
+      DROPPED at full HD. Fine at 720p / low fps.
+  OUTPUT logs/rheed/<YYYYMMDD_HHMMSS>_<sample>/
+           az1_057.9deg_best.png, az1_057.9deg_avg3.png, …   (angles rel. to clip start)
+           rotation_summary.json (period, rpm, confidence, fold, picks, settings, warning)
+           frames.csv            (Frame, Unix_Time, Elapsed_s, Azimuth_deg, Quality)
+         logs/rheed/snapshots/<stamp>.png     logs/rheed/videos/<stamp>.avi (MJPG)
+
+OFFLINE VIDEO ANALYSIS (video_analysis.py + video_tab.py, added 2026-10-06;
+  restructured same day into 3 steps + NO automatic writing — see "3-STEP PANEL"):
+  For older / recorded videos (Canon MVI_*.MP4 H.264, our .avi recordings, anything
+  cv2/FFmpeg reads). probe_video(path) → VideoInfo(w, h, fps, n_frames, codec).
+  VideoAnalysis.start(path, out_root, start_s, end_s, analysis_fps=10, sample, roi,
+    expected_rpm, n_picks, orientation, avg_deg=1.0, save_enhanced) — worker thread,
+    on_progress / on_done(summary|None, msg), abort(); never raises.
+  PASS 1: every step-th frame (step = fps/analysis_fps, raised so ≤ MAX_ANALYSIS_FRAMES
+    = 3000 — the correlation is n²) → thumbs, t = frame_no / fps (CFR files) →
+    analyze_rotation.
+  PASS 2: ONE sequential full-rate read (grab(); retrieve() only frames needed): every
+    frame gets azimuth from T; every frame within ±avg_deg of a kept azimuth in ANY
+    revolution is averaged (slow rotation → many frames/degree: 17–34 frames per
+    azimuth on MVI_2527). No rotation → ±0.25 s around each top-quality frame.
+  PASS 2 also stores every frame's LINE PROFILE across the streaks inside the profile
+    band (default = analysis ROI, else whole frame) → spatial.ProfileSeries (n × m
+    float32, ≤ MAX_PROFILE_FRAMES = 30000 else decimated; 3889 × 864 = 13 MB here).
+  RESULT = summary dict in memory: info, result, settings, t0, step, frame_numbers,
+    times, thumbs, roi, picks [{angle_deg, score, best_frame, best_time_s, best (BGR
+    uint8), avg (BGR float32), n_avg}], profiles. NOTHING is written (user request
+    2026-10-06 — the first version auto-saved to logs/rheed/video/<stamp>_<sample>/;
+    three such folders from the user's own runs exist there, left untouched).
+  ProfileExtraction(path, f0, f1, band, orientation) re-reads only the profiles for a
+    new band (one full-rate pass, ~35 s for the 130 s clip).
+  Timing: 130 s 1080p30 H.264 → ~43 s total (pass 2 now decodes every frame).
+  FIRST REAL VIDEO — MVI_2527.MP4 (130 s, 1080p29.97): screen fills only x≈300–1200,
+    very dim (mean ~5/255, peak ~170 green), streaks HORIZONTAL. Result: T = 96.7 s
+    (0.62 rpm), 1.3 revs, self-similarity 0.78, orientation auto → horizontal.
+    The pattern shows 5 near-identical events per revolution (every ~19.3 s, each a
+    double peak ~2 s apart); only at 96.5 s do the event SHAPES match (wide doubles at
+    13.5 s and 110.5 s). Physical origin of a 5-event revolution NOT confirmed with the
+    user — if the real rpm was ~3.1, T/5 is the true period; enter the rpm to force it.
+
+3-STEP PANEL (right column = QTabWidget, each step in a QScrollArea, no h-scroll):
+  ① Import & analyse — range, rpm, streaks, analysis fps, azimuths to keep, ±°, ROI,
+     ▶ Analyse video, Last result. Viewer / CV views / cursors as before (shared).
+  ② Spatial (video_steps.SpatialStep) — recomputes LIVE from memory (80 ms debounce):
+     Azimuth: kept direction (default = best q) or "Cursor azimuth" (yellow line on 📈
+       Quality vs azimuth); ±° window; no rotation → all frames.
+     Profile band: "Own band" = GREEN box on the image + ▶ Re-extract profiles.
+     Streak peaks: background width (default 100 px), threshold σ (5), min separation
+       (20) → table (pos px, order, height, FWHM, SNR); click a row / click near a
+       peak on 📏 Profile = the peak FOLLOWED for intensity; "Set (00)" = order 0;
+       "Seed Δ" = select two neighbouring peaks → their distance seeds the fit; "Auto Δ".
+       Peak lines + order labels drawn on the viewer image (toggle).
+     Intensity vs time (followed peak): Azimuth-locked (1 pt/rev) · All frames · All
+       frames ÷ rotation (normalised); window ± px (0 = FWHM/2); FFT period range →
+       dominant period, ML/s if 1 osc = 1 ML; flags periods ≈ T/k as rotation.
+     Calibration px→Å: Reference (known d at this azimuth, fill from materials table,
+       "Use current Δ") or Geometry (keV, sample→screen mm, screen mm/px).
+     Identify: tolerance % → candidates table; 🔎 COD formula lookup (thread) adds this
+       session's surface nets; "Δ per kept azimuth" + √2/√3 ratio hint.
+     Result tabs it adds: 📏 Profile & peaks · 🕸 Kymograph (profile vs time, draggable
+       time cursor, followed-peak window) · 📈 Intensity vs time · 〰 FFT.
+  ③ Export (video_steps.ExportStep) — base folder (default logs/rheed/video, Browse) +
+     TYPED folder name (↻ suggests <date_time>_<sample>; unsafe chars → "_"), confirm
+     before writing into a non-empty folder. Options: azimuth images (best + avg PNG),
+     averages as 16-bit PNG (grey×256), _enh copies, frames.csv, analysis_summary.json
+     (settings, rotation, picks, spatial summary), spatial CSVs (profile_az*, peaks_az*,
+     intensity_all_frames_az*, intensity_azimuth_locked_az*, identification) +
+     kymograph PNG, plot screenshots (pyqtgraph ImageExporter, every result tab).
+
+SPATIAL ANALYSIS (spatial.py — numpy only, requests only for COD):
+  Geometry: streak spacing Δ = L·λ/d_row, d_row = spacing of atomic rows ∥ beam.
+    hex net a: beam ∥ ⟨11-20⟩ d = a·√3/2, ∥ ⟨1-100⟩ d = a/2 (ratio √3, 30° apart);
+    square a: ⟨10⟩ d = a, ⟨11⟩ d = a/√2 (ratio √2, 45°); rect: b, a, ab/√(a²+b²).
+    Nets from bulk cells: hex/trig (0001) → a; cubic F (001) square a/√2, (111) hex
+    a/√2; cubic P/I (001) a, (111) a√2; tetragonal (001) a; orthorhombic rect a×b.
+  λ(keV) relativistic: 12.2643/√(V(1+0.97848e-6·V)) Å. Calibration k = Δ·d (px·Å).
+  find_peaks: Gaussian smooth 2 px → minus baseline (rolling MIN over bg width, running
+    mean, lifted by the median residual) → local maxima > σ·noise (noise = MAD of the
+    raw profile's first difference /√2) → strongest-first min separation → parabolic
+    sub-px position, FWHM by half-max interpolation. Peaks with FWHM > bg width are
+    DIFFUSE GLOW and dropped — without that, MVI_2527's glow under the spot made 150–300
+    px "peaks" and the spacing fit returned 28 px instead of 117 px.
+  fit_spacing: seed Δ0 = distance from the (00)/strongest peak to its nearest peak of
+    ≥ 30 % its height (or user seed) → integer orders → least squares x = x0 + nΔ (3
+    iterations, |residual| ≤ 0.2) → Δ ± σ; peaks at n+½ flagged (×2 reconstruction).
+  peak_intensity: mean over ±half_w minus two flanking background windows; per frame.
+  azimuth_locked: per revolution, mean over frames within ±tol of the azimuth.
+  rotation_normalised: I / median-per-azimuth-bin (72 bins); bins < 20 % of max → NaN.
+  oscillation_period: interpolate NaNs, running-mean detrend (2·pmax), Hann FFT,
+    parabolic peak in [pmin, pmax].
+  cod_lookup(formula): GET https://www.crystallography.net/cod/result?formula=<Hill,
+    alphabetical, space-separated>&format=json (no key; fields a b c alpha beta gamma
+    sg file title) → dedup → surface_nets(). Materials Project OPTIMADE also answers
+    without a key but returns computed primitive (e.g. rhombohedral) cells — not used.
+  RESULTS ON MVI_2527 at 3.1 rpm (T = 19.303 s, 6.7 revs): kept azimuths 74/149/244/
+    266/359°; 244° and 266° (q 0.82/0.84) give the SAME Δ = 117.3 ± 1.0 px (4 orders:
+    rows 518/639/756/871 px; specular spot = 756) → one direction family split ±11°;
+    74° has no streaks (diffuse). Azimuth-locked spot intensity rises ~1.2 → 3.8 → back
+    over the clip (this is what the 96.5 s "period" was).
+  OPEN SOURCE LANDSCAPE (researched 2026-10-06): xRHEED (MIT, xarray toolkit: profiles,
+    kx–ky transform, predicted-spot overlay, lattice matching — github.com/
+    mkopciuszynski/xrheed); rheedium (MIT, JAX differentiable RHEED simulation from
+    CIF + fit-to-experiment — github.com/debangshu-mukherjee/rheedium); RHEEDsim-Python
+    (port of Wang & Smith 2011); sim-trhepd-rheed (GPL, dynamical RHEED/TRHEPD);
+    Auto-RHEED (arXiv 2609.15922, spacing / coherence length / growth rate + MCP);
+    RHEED-Viewer (live view). Databases: COD (used), OPTIMADE providers.
+
+LIVE INTENSITY TRACKING — RHEED OSCILLATIONS (tracking.py + live_tracking.py, 2026-10-07)
+  Roadmap R11 (phase-locked live acquisition) + the live half of R12. User request:
+  "record an approximate rpm, track the intensity, only process frames at/near the
+  peak to save processing, plot intensity vs time".
+  Live panel → group "Intensity tracking — RHEED oscillations" (control column is now a
+  QScrollArea) + result tab "📈 Intensity (live)" + CYAN intensity box on the image.
+  ROTATING mode:
+    1. Approx. rotation (rpm) + Lock length (rev, default 3) → 🔒 Lock rotation:
+       RotationLock records THUMBNAILS ONLY (no video, nothing saved) for revs·60/rpm s
+       → analyze_rotation(expected_period = 60/rpm, analysis ROI if ticked) →
+       LockResult(period_s, t_ref = time.time() of azimuth 0, picks [(az, q)]).
+    2. Drag the cyan box onto the specular spot / a streak; pick the direction;
+       Window ± (default 6°); Value per pass Peak (max of 3-frame smoothed) / Mean.
+    3. ▶ Start: IntensityTracker per frame computes ONLY the predicted azimuth from the
+       timestamp; frames outside ±window are skipped untouched; inside → box mean
+       (green-channel grey). On leaving the window the pass → ONE point.
+       ~3–5 % of frames processed (3.2 % at 3.1 rpm/±6°, 3.6 % at 10 rpm).
+    PHASE-LOCKED LOOP (per clean pass): peak time = intensity-weighted centroid of
+      the half-maximum run around the max (min-subtracted); err = peak − predicted;
+      t_cross = t_pred + 0.6·err; T += 0.3·err (z² − 1.1z + 0.4 → |z| 0.63/rev,
+      stable); T clamped to ±15 % of the lock; t_ref RE-ANCHORED at t_cross each pass
+      (otherwise a T update swings the phase by revs-since-lock × ΔT: 0.1 % after
+      30 revs ≈ 11°). "Clean" = window max−min ≥ 1 % of max (flat window → no steer).
+    ACQUISITION: unclean pass or |err| > ½ window → window ×2 (max ±25°, below the
+      30°/45° neighbour spacing of 6-/4-fold surfaces); clean & centred → ×0.7 back.
+      After a pass, a new one may start only once |phase − az| > 90° (REARM_DEG) —
+      without it passes fired 0.2 s apart when the window widened / t_ref moved.
+    WHAT FAILED ON THE WAY (don't retry): argmax + parabola peak (noise with 4 frames
+      / pass, often on the window edge) + edge "hunting" steps (knocked the phase every
+      pass); noise from frame-to-frame diffs as the "clear peak" test (the diffs ARE
+      the peak's slope — nothing ever qualified); T from two consecutive peaks only
+      (slow after an rpm step); window up to ±45° (pulled to the neighbour direction).
+  STATIC mode: every Nth frame's box mean → the classic oscillation trace.
+  ⏱ t = 0 = growth start (plot origin; restarts the sim's test oscillation). FFT period
+    range (default 0.5–60 s) → oscillation period → ML/s (1 osc = 1 ML assumed).
+    Rotating: status warns only periods > 2T are real (one sample per revolution).
+  💾 Save CSV… — only on request (QFileDialog, default logs/rheed/tracking/
+    <stamp>_<sample>_intensity.csv): '#' header (mode, box, t0, lock T, direction,
+    window, end T) + Unix_Time, Time_s, Intensity, Phase_err_deg, Clean_peak.
+  Points are POLLED (snapshot(since)) by a 300 ms QTimer — no per-frame signals.
+  SOURCES ADDED FOR TESTING:
+    SimRHEEDCamera(osc_period, osc_amp, osc_decay): streaks + specular × (1 + amp·
+      cos(2πt/P)·e^(−t/τ)); azimuth now INTEGRATED so rpm can change while running
+      (drift tests); start_growth(). The GUI's sim uses P = 20 s, amp 0.2.
+    VideoReplayCamera(path, speed, loop) — source combo "Replay a video file (test)":
+      a recorded video as the live camera. Frame.t = start + video time/speed (the
+      FILE's timing — wall-clock stamps were tried first: at 2× a 1080p H.264 file
+      decodes < 60 fps, playback lagged ~2 % and the lock read a 2 % longer period).
+      _FrameSource._loop accepts (image, timestamp) from _grab(); _publish(img, t).
+  VALIDATED (2026-10-07):
+    Sim drift tests (lock, then rpm step mid-run): 3.1 rpm +0.5 % → T −0.04 %, 0.14°;
+      10 rpm +0.5 % → +0.03 %, 1.0°; 10 rpm +2 % → +0.04 %, 0.9° (widened 2 passes);
+      20 rpm +3 % (4 frames/pass) → −0.07 %, 2.1°. Static 3 s oscillation → FFT 2.999 s.
+    GUI (offscreen, sim): lock 6.001 s (true 6.000), rotating 10 pts/60 s at 3.6 %,
+      static 20 s oscillation → FFT 19.61 s (2¼ periods), CSV OK.
+    Replay MVI_2527 at 2×: lock picks 237°/276° (q 0.74/0.80), 4 clean passes,
+      9 % processed (window widened). FINDING: on this video a 2.3–5 rev lock scatters
+      ±3 % around the full-clip 19.303 s (non-uniform rotation rev-to-rev?), so the
+      PLL must — and does — pull T in over the first passes; only 4 passes fit the clip.
+
+GUI (RHEEDTab) — outer QTabWidget: "📡 Live camera" (RHEEDLivePanel) | "🎞 Video analysis"
+  (RHEEDVideoPanel). RHEEDTab(log_fn, out_root, start_sim, video_path) / shutdown() as before.
+ VIDEO PANEL: 📂 Open video… (or drag-drop a file) · info (w×h fps dur frames codec).
+    Viewer with yellow ROI, ▶/⏸ play, scrub slider (debounced 40 ms seek; viewer has
+    its own cv2.VideoCapture on the MAIN thread), ⇤ Start here / End here ⇥, Auto
+    contrast (display only, default ON). Results tabs: 📉 Quality vs time (blue region
+    = analysis range, draggable, synced with the spinboxes; yellow line = current frame;
+    CLICK seeks; green dashed = kept azimuths) · 🖼 Saved azimuths (enhanced avg;
+    CLICK a thumbnail → viewer jumps to its best frame) · 📈 vs azimuth · 🔁 vs lag.
+    Controls: Start/End s, Whole video, Sample (default file name), rpm (auto),
+    Streaks run (Auto/Vertical/Horizontal), Analysis rate fps, Azimuths to keep,
+    Average ±°, ROI only, save enhanced, ▶ Analyse video / ✕ Abort, Last result.
+ CV VIEW ("👁 View:" combo + "Streak profile", added 2026-10-06) — the video as the
+    algorithm sees it, drawn with the SAME functions (rotation.make_thumb /
+    streak_profile / correlation_input — factored out of analyze_rotation so they can't
+    drift apart; results bit-identical after the refactor):
+      Original · CV 1 grey thumbnail (ROI, 128 px — live, works before analysis) ·
+      CV 2 minus clip mean · CV 3 drift-removed = correlation input.
+    CV 2/3 use the NEAREST ANALYSED frame (VideoAnalysis now returns summary["thumbs"],
+    ["times"], ["roi"]; stacks cached per analysis), symmetric levels (grey = 0).
+    Streak profile: blue = profile across the streaks, dashed = running mean,
+    q = std(difference). Beside the image (horizontal streaks, Y-linked) or under it
+    (vertical, X-linked). Linked side must have NO axis/title or rows misalign → q is a
+    TextItem parented to the plot's ViewBox.
+ CURSORS: yellow lines on 📉 Quality vs time and 📈 Quality vs azimuth are DRAGGABLE
+    (InfiniteLine.sigDragged → 15 ms debounced seek). Azimuth drag → frame at that angle
+    in the revolution nearest the current time. Readout: t · frame · az · q · (CV note).
+    The analysis-range region's BODY is not draggable (region.movable=False, edges still
+    are) so drags inside it reach the cursor. Viewer decode: forward jumps ≤ 45 frames
+    grab() instead of seeking; CV 2/3 never decode. 40 drag steps ≈ 0.8 s on 1080p H.264.
+ LIVE PANEL (unchanged except a display-only "Auto contrast" checkbox in the source bar):
+  Source bar: Source combo ([idx] name (w×h) … + "Simulated (test)") · 🔍 Scan · Res ·
+    Format (Auto/MJPG/YUY2) · Connect/Disconnect · LED (green ok / orange dark /
+    yellow connecting / red disconnected-retrying) · state text · w×h fps.
+  Left: live view (+ optional yellow analysis ROI); below it tabs: 🖼 Saved azimuths
+    (avg images, captions angle/n/quality) · 📈 Quality vs azimuth · 🔁 Self-similarity
+    vs lag (period marked).
+  Right: Capture (sample name, 📷 Snapshot, ⏺ Record/⏹ Stop) · Rotation sync (clip s,
+    rpm 0=auto, azimuths to keep, ROI only, keep clip, lossless, ▶ Capture & Analyse /
+    ✕ Abort, progress) · Last result (+ 📂 Open folder).
+  PyQt5 gotcha hit while testing: an unhandled exception inside a Qt slot ABORTS the
+    process (PyQt ≥5.5); on Windows that shows a blocking abort dialog = looks like a
+    hang. (Was a test-harness print of emoji to a cp1252 pipe, not app code.)
+
+INTEGRATION INTO THE MAIN CONTROLLER (DONE 2026-10-21 — task R9, gui_app part):
+  Why: running rheed_app.py as a SECOND program next to the controller coincided with
+    COM-port trouble (user). rheed_app never opens a serial port, so the cause is not
+    a port conflict between programs — suspects: USB (the Guermok streams ~124 MB/s
+    uncompressed 1080p and draws power — if it shares a hub/dock with the USB-RS485
+    adapters, they can be disturbed or brown out) or CPU load. Not verified (tools
+    were not attached on the dev laptop). One process now; if COM trouble persists
+    WITH the integrated tab, check the USB topology (Device Manager → View by
+    connection, or Get-PnpDeviceProperty DEVPKEY_Device_Parent chain) and give the
+    Guermok its own port / a powered hub.
+  gui_app._right(): tab "📡 RHEED" = MainWindow._rheed_tab_page(): header row + RHEEDTab(
+    log_fn=self._rheed_log (📡-marked System Log lines), out_root=log_paths.RHEED_DIR,
+    video_root=<app>/logs/rheed/videos). Import/creation failure (no OpenCV) → orange
+    label, controller still runs.
+  ⧉ Pop out / Window menu → _RHEEDWindow(QMainWindow) in the SAME process; the panel is
+    reparented (setCentralWidget); closing the window emits closed → _rheed_dock()
+    takeCentralWidget() back into the tab (the camera keeps running).
+  closeEvent: rheed_tab.shutdown() FIRST, then the pop-out window (closed disconnected).
+  RHEEDLivePanel: camera scan on FIRST SHOW (showEvent), not at construction — the
+    controller builds the tab at startup and the scan opens every DirectShow device;
+    _refresh_view skips rendering while the tab is hidden (capture / recording /
+    tracking threads keep running).
+  rheed_app.py (standalone) uses the same log_paths locations.
+  log_fn is called on the MAIN thread only. build.spec needs "cv2" + the rheed package
+  (and the conda Library/bin DLL lessons from Section 19 apply).
+  The tab's video mode writes to <out_root>/video/ (out_root/"video" is passed in by
+  RHEEDTab — nothing extra to wire). Frozen build: reading H.264/MP4 needs
+  cv2/opencv_videoio_ffmpeg4100_64.dll (ships in the opencv wheel's cv2 folder; the
+  name changes with the opencv version) — without it the exe opens .avi(MJPG) but
+  every Canon .MP4 fails "cannot open video". Smoke-test the exe on an MP4.
+
+TESTING (no camera needed):
+  python rheed_app.py --sim                 interactive
+  python rheed_app.py --video MVI_2527.MP4  video mode (the reference real clip, 490 MB,
+                                            project root, untracked)
+  Headless: SimRHEEDCamera + RotationCapture with on_done → assert period/files;
+  offscreen GUI: QT_QPA_PLATFORM=offscreen QT_QPA_FONTDIR=C:/Windows/Fonts (fonts
+  otherwise missing in screenshots); PYTHONIOENCODING=utf-8 when printing log text.
+  KNOWN HARNESS QUIRK: a script that builds MainWindow, closes it WITHOUT app.exec_()
+  and exits → access violation (−1073741819) at interpreter teardown — identical on the
+  original git HEAD, so not caused by changes; main.py (sys.exit(app.exec_())) differs.
+  Print results before exit and flush (the crash loses buffered stdout).
+  ALGORITHM REGRESSION (run after ANY change to rotation.py) — expected values:
+    analyze_rotation on rendered sim frames (render_sim_pattern, 480×270, 30 fps,
+      10 % random drops, ±4 ms jitter, clip max(20 s, 2.5 T)):
+      3 / 5 / 7.3 / 10 rpm → |period error| ≤ 0.08 %, picks ≈ 0/90/180/270°, with
+      and without expected_period; same frames rotated 90° (cv2.ROTATE_90_CLOCKWISE)
+      → orientation "horizontal", same period; static substrate → "no rotation".
+      15 rpm: OK with expected_period; without it one jitter seed locks 2T (R18,
+      pre-existing — identical with detrend_s=0).
+    MVI_2527.MP4 thumbnails (every 3rd frame, 128×72, full frame): auto → 96.7 s,
+      horizontal, self-similarity 0.78; expected 96.5 s → 96.9 s / 0.86;
+      detrend_s=0 → 97.0 s / 0.72 (the old algorithm).
+    VideoAnalysis on the whole MVI_2527 → 96.70 s auto / 19.303 s with rpm 3.1, ~43 s.
+    Spatial (rpm 3.1, ROI (288,108,960,864), az 266° ±1°, defaults): peaks 518.5/639.1/
+      666.7(unassigned)/756.1/870.6 px, Δ = 117.35 ± 0.96 px from 4 orders; same Δ at
+      243.6°; 74° → no peaks. Export of everything → 35 files.
+  GUI checks: all 4 View modes render (CV 2/3 show the "run an analysis" note before
+    one exists), dragging the time cursor follows, azimuth cursor at 193° → 51.85 s
+    (= the 193° pick's best frame), streak profile aligned with the ROI rows.
+
+ROADMAP / TASK LIST  (✓ done 2026-10-01 unless dated, ☐ open)
+  ✓ R1  Camera layer: UVC capture thread, auto-reconnect, dark flag, frame fan-out
+  ✓ R2  Simulated rotating RHEED source (test mode)
+  ✓ R3  Standalone app + RHEEDTab: live view, source scan, status, snapshot, video
+  ✓ R4  Rotation sync: period detection, azimuth assignment, best-azimuth selection
+  ✓ R5  Short clip → extract best + revolution-averaged frames → delete clip
+  ✓ R6  Camera probe diagnostic
+  ◐ R7  2026-10-07: devices identified (see HARDWARE PATH: Guermok = index 2, 1080p30);
+        probe fixed (negative FOURCC crashed it; each combination now try/except).
+        Still to verify: Canon HDMI picture through the Guermok, latency, DARK_STD on a
+        real beam-off screen, rotation detection live.
+  ☐ R7  (rest) HARDWARE BRING-UP: run the probe with the 90D + capture device; confirm index,
+        1080p30 format, latency, clean HDMI; tune DARK_STD on a real beam-off screen;
+        verify rotation detection on a real rotating substrate (growth drift, wobble).
+  ☐ R8  Exposure handling: exposure is set on the 90D itself (the HDMI path carries no
+        camera control); add a saturation warning (clipped streak pixels corrupt
+        intensity analysis) and a histogram readout.
+  ◐ R9  gui_app integration DONE 2026-10-21 (tab + pop-out, see INTEGRATION). Still
+        open: build.spec (cv2 + opencv_videoio_ffmpeg DLL, rheed package) — R19.
+  ☐ R10 Calibrated azimuth: user marks one known direction (e.g. [110]) in a result →
+        absolute azimuth labels; persist per substrate holder.
+  ✓ R11 (intensity part, 2026-10-07) Phase-locked live intensity tracking — see
+        "LIVE INTENSITY TRACKING". Not done: grabbing full frames/images per pass (only
+        the box mean is kept), tracking several directions at once.
+  ☐ R11 (rest) Phase-locked live acquisition: using the measured T and phase, grab frames
+        LIVE (losslessly) each time the substrate passes a chosen azimuth — no clip at
+        all, continuous; also the basis for R12 on a rotating substrate. Must re-lock
+        periodically (rpm drift).
+  ◐ R12 RHEED oscillations — live box intensity (rotating 1 pt/rev, or static every
+        frame) + FFT done 2026-10-07; still open: shutter events → t0, logging to the run
+        xlsx, background-subtracted box, multiple boxes.
+  ☐ R12 (rest) RHEED oscillations: user ROIs (specular spot / streak) → intensity vs time at
+        the camera frame rate (static) or once per revolution at a fixed azimuth
+        (rotating, via R11); FFT/peak-fit period → growth rate (ML/s); tie into the
+        shutter events from the recipe engine (shutter-open = t0) and log to the run xlsx.
+  ☐ R13 Pattern characterisation: streak spacing → in-plane lattice constant (needs
+        camera-length/energy calibration from a known substrate), streak vs spot
+        (2D vs 3D growth) metric, reconstruction (fractional-order streak) detection,
+        streak width (FWHM) vs time, Kikuchi-line visibility.
+  ✓ R14 (clip part, 2026-10-21) RHEED_VIDEO recipe action — clip or still, numbered,
+        metadata .txt, "RHEED clips" sheet in the run xlsx (Section 6). Still open: a
+        RHEED_ROTATION_CAPTURE action (rotation-sync keyframes from a recipe) and an
+        in-recipe intensity-tracking start/stop.
+  ✓ R16 Offline video analysis mode (🎞 tab) — validated on MVI_2527.MP4 (2026-10-06).
+        + CV view modes and draggable time/azimuth cursors (same day).
+  ✓ R20 3-step video panel, no auto-export, spatial analysis (spacing, intensity vs
+        time, FFT, calibration, identification, COD) — 2026-10-06. Covers the video
+        side of R12 (oscillations) and R13 (spacing → lattice).
+  ☐ R21 Validate spatial numbers with a calibrated run: record the substrate before
+        growth at a known azimuth → Reference calibration → check d against the film.
+        Beam energy / camera length / screen scale for OUR system are unknown so far.
+  ☐ R22 Optional: simulate candidate patterns (rheedium, MIT) and overlay on the image
+        (xRHEED-style predicted-spot overlay) for richer identification than spacing.
+  ☐ R19 build.spec: include opencv_videoio_ffmpeg*.dll (MP4 reading) — part of R9.
+  ☐ R17 Confirm MVI_2527's real rpm / substrate symmetry with the user — user recalls
+        ~19.3 s (≈3.1 rpm) as the true period (2026-10-06), i.e. the 96.5 s match would be
+        a coincidence/5-rev beat; they will supply the rpm — enter it and re-check;
+        add Streaks-run combo to the live panel too (live uses auto today).
+  ☐ R18 Pre-existing: at 15 rpm with jittered timestamps the lag curve is spiky and one
+        seed of 6 locks 2T (original algorithm identical) — consider smoothing the curve.
+  ☐ R15 Data management: per-run RHEED folder named like the run log, retention rules,
+        thumbnail sheet in the run Excel export.
+
 ################################################################################
 # END OF CONTEXT FILE
-# Total sections: 17 + Section 4b (EPC3004 hardware)
-# Key files: gui_app.py, heat3.py, epc3004.py, recipe_engine.py,
+# Total sections: 20 + Section 4b (EPC3004 hardware)
+# Key files: gui_app.py, recipe_editor.py, heat3.py, epc3004.py, recipe_engine.py,
 #            bep_manager.py, sim_devices.py, recipe_logger.py,
-#            data_logger.py, brax3400.py, arduino_shutter.py
+#            data_logger.py, brax3400.py, arduino_shutter.py, ln2_monitor.py,
+#            rheed/ (camera.py, rotation.py, capture.py, tracking.py, live_tracking.py,
+#                    video_analysis.py, spatial.py,
+#                    export.py, rheed_tab.py, video_tab.py, video_steps.py,
+#                    ui_common.py, materials.csv), rheed_app.py
 # Diagnostics: diagnostics/timing_diag.py  ← hardware perf
 #              diagnostics/plot_diag.py     ← GUI plot pipeline perf
 #
 # ── Changelog ────────────────────────────────────────────────────────────────
+#
+# 2026-10-21  RECIPE ACTION RHEED_VIDEO (R14) — Param1 = clip seconds (0 = still). Uses
+#             the RHEED tab's camera; files <sample>_Sub<T>C_SeIn<ratio>_rheed_NNN.avi +
+#             .txt metadata (conditions + ~4 Hz P/T series) in rheed/<run name>/, NNN
+#             counting up through GOTO loops; recorded locally then moved to Box; "RHEED
+#             clips" sheet in the run xlsx, whose name now uses the run START stamp (=
+#             the RHEED folder name). recipe_engine (hook rheed_capture), rheed.capture.
+#             record_clip, recipe_logger (run_name, add_rheed_clip), gui_app + recipe_editor
+#             (action list, Column Guide, timeline). Added .gitignore (none existed —
+#             secrets/ was documented as ignored but was not).
+#
+# 2026-10-21  COM DEFAULTS · LOGS TO BOX · RHEED INSIDE THE CONTROLLER.
+#   gui_app: default ports BRAX COM3 · HEAT3 COM6 · Arduino COM5 · EPC3004 COM7 (top bar
+#             left → right), per-entry port descriptions as tooltips.
+#   log_paths.py (NEW): ~/Box/logs/{system,deposition,rheed}, local fallback, startup line.
+#   data_logger v3: CSV writer thread (Box-safe), pop_notes(). LN2 + BEP histories →
+#             system/ (copied once). Run .xlsx → deposition/ with local fallback (it was
+#             lost silently if the save failed). _LogBridge replaces QTimer.singleShot
+#             from the export thread (BUG 7/20).
+#   RHEED: 📡 RHEED tab + same-process pop-out window (R9); lazy camera scan; no rendering
+#             while hidden; raw videos stay local. rheed_app uses log_paths.
+#   Tested offscreen: ports, startup line, Box paths, tab/pop-out/dock, .xlsx written to
+#             Box\logs\deposition (test file removed), writer fallback.
+#
+# 2026-10-07  RHEED camera bring-up, first contact: lab laptop devices identified
+#             (Guermok USB3 HDMI grabber = index 2, 1920×1080 @ 30 fps). Source dropdown
+#             no longer shows the misleading idle size; ⚠ + orange status when the
+#             delivered size differs from the request; probe crash (negative FOURCC) fixed.
+#
+# 2026-10-07  LIVE RHEED INTENSITY TRACKING (phase-locked, oscillations).
+#   rheed/tracking.py (NEW): RotationLock (thumbnails only → T, phase), IntensityTracker
+#             (per-frame azimuth from the clock; only frames within ±window of the
+#             chosen direction processed → 1 point/rev; PLL with re-anchoring,
+#             acquisition-mode window widening, re-arm; static mode).
+#   rheed/live_tracking.py (NEW): TrackingGroup — controls, 📈 Intensity (live) plot,
+#             cyan intensity box, ⏱ t = 0, FFT → ML/s, 💾 Save CSV (on request only).
+#   rheed/camera.py: SimRHEEDCamera growth oscillation + integrated azimuth (rpm may
+#             change live); VideoReplayCamera (file-timed frames); _publish(img, t).
+#   rheed/rheed_tab.py: tracking group + plot tab, control column scrolls, "Replay a
+#             video file (test)" source. ui_common: CY colour.
+#   Validated on sim drift tests and on a 2× replay of MVI_2527 (Section 20).
+#
+# 2026-10-06  MOUSE-WHEEL GUARD (wheel_guard.py, NEW): scrolling no longer changes spin
+#             boxes / dropdowns / sliders in the controller, Recipe Editor or RHEED app;
+#             the page or table scrolls instead. install(app) in main.py, recipe_editor.py,
+#             rheed_app.py. Section 12.
+#
+# 2026-10-06  RHEED OFFLINE VIDEO ANALYSIS + algorithm fixes from the first real video.
+#
+#   rheed/rotation.py: streak orientation (auto/vertical/horizontal; MVI_2527 has
+#             horizontal streaks — the vertical-only score measured the screen rim);
+#             temporal high-pass before correlating (slow drift dominated raw
+#             self-similarity); edge-of-window warning; res.times/orientation/detrend_s.
+#             Regression: sim 3–15 rpm unchanged (≤0.08 %), rotated-camera sim now
+#             auto-detected, static → no rotation, live RotationCapture 10.00 rpm.
+#   rheed/video_analysis.py (NEW), rheed/video_tab.py (NEW), rheed/ui_common.py (NEW,
+#             palette/helpers moved out of rheed_tab). RHEEDTab = two-mode wrapper;
+#             old class → RHEEDLivePanel (+ Auto contrast display option).
+#             rheed_app.py --video FILE. See Section 20 "OFFLINE VIDEO ANALYSIS".
+#             Same day: CV view modes (algorithm's-eye view + streak profile) and
+#             draggable cursors on the time / azimuth plots (Section 20 "CV VIEW").
+#             Same day: 3-step panel (① Import & analyse · ② Spatial · ③ Export);
+#             analysis no longer writes files — ③ Export with a typed folder name.
+#             New rheed/spatial.py, export.py, video_steps.py, materials.csv; COD
+#             lookup. MVI_2527 at 3.1 rpm: Δ = 117.3 ± 1.0 px, 4 orders.
+#
+# 2026-10-01  RHEED CAMERA PACKAGE — standalone app + rotation-synchronised capture.
+#
+#   New package rheed/ (Section 20) + rheed_app.py + diagnostics/rheed_camera_probe.py.
+#             Canon 90D via HDMI → USB capture (UVC) read with OpenCV DirectShow;
+#             capture thread survives unplug/replug (2 s retry), dark-frame flag,
+#             frame fan-out with drop counting. SimRHEEDCamera for test mode.
+#             Rotation sync: self-similarity vs time-lag → period (earliest strong peak,
+#             not global max — 2T beat T in testing), per-frame azimuth, streak-contrast
+#             quality → best azimuths; short temp clip (system temp dir, MJPG) → best +
+#             revolution-averaged PNGs → clip deleted. Validated on synthetic data only
+#             (3–15 rpm, ≤0.22 % period error); the camera was NOT connected — hardware
+#             bring-up is task R7. Roadmap R7–R15 in Section 20.
+#             Dependency: opencv-python-headless 4.10.0 installed in the Anaconda env
+#             (pinned <4.11 to keep numpy 1.26.4). requirements.txt updated.
+#             Not yet in gui_app / build.spec (task R9).
+#
+# 2026-09-25  STANDALONE RECIPE EDITOR + FLUX-CALIBRATION ACTIONS + RUN PROGRESS.
+#
+#   recipe_editor.py / recipe_editor.spec (NEW — Section 19):
+#             Hardware-free recipe builder so lab members can write recipes ahead of
+#             time on their own PC; ships as dist/RecipeEditor/RecipeEditor.exe (69 MB
+#             zipped). Same table, dropdowns, drag-drop reorder, Column Guide and
+#             preview plot as the Recipe tab, plus New/Save As/dirty tracking and
+#             Up/Down buttons. Saves the identical 5-col sheet, so files round-trip.
+#             Three Anaconda+PyInstaller build traps found and fixed in the spec
+#             (conda Library/bin DLLs for pyexpat/_ctypes/Qt; pyqtgraph hook dragging
+#             in numba/scipy/h5py/sphinx — 345 MB → 178 MB). The exe builds clean but
+#             crashes on launch if the DLLs are missed, so always smoke-test the binary.
+#
+#   New recipe actions (gui_app.py + recipe_editor.py + recipe_engine.py):
+#             INCREASE_TEMP — Param1 = source, Param2 = Δ°C. Steps the SETPOINT (not the
+#               live PV) so repeated passes of a loop land on exact temperatures.
+#             MEASURE_BEP — Param1 = In/Se/Both. BLOCKS the recipe thread for the sweep
+#               (~10 s per source, ~50 s Both) via the new BEPManager.measure_sync();
+#               RecipeEngine.stop() now calls bep.abort() so a stop can interrupt it.
+#             Intended pattern: INCREASE_TEMP → WAIT_TEMP → MEASURE_BEP → GOTO gives an
+#               unattended temperature-vs-flux sweep for In or Se.
+#
+#   BEP run-log sheets (recipe_logger.py):
+#             New rec_log.bep_runs + add_bep_measurement(); export writes one
+#             bep_measure_rec_# sheet per MEASURE_BEP STEP (In in cols A/B, Se in D/E,
+#             numeric summary + full 20 Hz trace + a chart per source).
+#             RecipeEngine.on_bep_result fires once per STEP carrying all its records —
+#             it was briefly once per SOURCE, which split a single "Both" sweep across
+#             rec_1 (In) and rec_2 (Se); a Both sweep is ONE measurement and ONE sheet.
+#
+#   Recipe preview plot (both files):
+#             GOTO no longer draws a cycle plus dead space: the body is traced once and
+#             stretch() scales every collection recorded at/after the loop start, so the
+#             one cycle fills the whole looped span in proportion. Label is two lines:
+#             "×N (total)" / "cycle length: <one pass>". Total estimate is loop-aware.
+#             Consequence: an INCREASE_TEMP staircase shows ONE step, not the full climb.
+#             Both-shutters-open recoloured green → BLUE. MEASURE_BEP windows drawn as
+#             silver bands tagged green "In" / orange "Se" (both tags for Both).
+#             Timeline now returns an 8-tuple (bep_regions appended).
+#             Indium tracked for timing only (in_t/in_rate) so an In calibration sweep
+#             estimates correctly without moving the Se/Sub traces.
+#
+#   Runner UI (gui_app.py):
+#             Run progress row under the toolbar: % bar, "Loop: 3/5" GOTO pass counter,
+#             "Elapsed · Time left (est.)" and "Est. done: HH:MM:SS", 1 Hz refresh from
+#             the loop-aware estimate. Clamps at 100% on overrun; resets when idle.
+#             Recipe toolbar gained New + Save As; Save now writes over the loaded file
+#             instead of always re-prompting (self._recipe_path). New is refused mid-run.
+#             PressBox: exponent promoted from a tiny dim superscript to full value-size
+#             E-notation ("9.20E-9" + "Torr" below) — the exponent is the number that
+#             matters on a vacuum gauge.
+#
+#   Known-broken (pre-existing, unrelated): test_recipe.py points at a hardcoded
+#             /mnt/user-data/uploads/recipe.xlsx and fails before testing anything.
+#             minimalmodbus is in build.spec hiddenimports but is imported nowhere.
 #
 # 2026-05-06  RAMP_TEMP action added; WAIT_TEMP channel-select bug fixed (BUG 9).
 #             Recipe table expanded to 6 columns (added Rate °C/min col for RAMP_TEMP).
@@ -1848,5 +2987,57 @@ SECTION 17: HOW TO ADD A NEW HARDWARE DEVICE
 #             Safety tab spinbox defaults updated to match.
 #             Tooltip and log message in _standby_all_click updated to reflect
 #             In ramp 100°C/min.
+#
+# 2026-08-12  LN2 dewar level monitor added (new Section 18):
+#
+#   New module (devices/ln2_monitor.py):
+#             LN2Monitor: tracks liquid nitrogen level from the Air Products APDirect
+#             portal (tank 52228). Twice-daily in-app scheduler (default 08:00/20:00) +
+#             manual refresh; history persisted to logs/ln2_history.csv (survives restart).
+#             Credentials encrypted at rest with Windows DPAPI (ctypes CryptProtectData/
+#             CryptUnprotectData, no extra dependency) — never in source, chat, or logs.
+#             One-time setup: tools/setup_ln2_credentials.py, run manually by the user in
+#             their own terminal (getpass hidden input).
+#             SCRAPER STATUS (updated same day, after the user supplied a HAR capture):
+#             apdirect.airproducts.com confirmed to be an Angular SPA — readings come
+#             from a JS-called JSON API, not static HTML. _do_fetch() is now fully
+#             implemented: login page GET (scrape __RequestVerificationToken) -> form
+#             POST (username/Password/password/token) -> GET ShipToList (current
+#             reading + true fullValue) -> GET GetEquipmentReadings (history backfill,
+#             deduped via new _merge_history()). fetch() still fails safely at any step
+#             (bad creds, layout change, network error) — GUI falls back to its stale
+#             (yellow) state. FULL_SCALE_IN corrected 120 (guessed) -> 46 (confirmed);
+#             full_scale_for() now prefers the live per-tank value when available.
+#             HAR HANDLING: the user's apdirect.airproducts.com.har was never read
+#             directly — a script redacted every password/token/cookie value (regex on
+#             key names + wholesale cookie redaction) to a summary file BEFORE that
+#             summary was read, and a grep pass confirmed no password value survived
+#             redaction. The raw .har (which does contain the real plaintext password —
+#             HAR captures raw POST bodies) was flagged to the user as a standalone risk
+#             since it was sitting inside the Box-synced project folder.
+#
+#   GUI (gui_app.py):
+#             New DewarFillWidget + LN2Panel widgets: vertical fill graphic (most recent
+#             reading) beside a pyqtgraph time-series (scatter+line, last 7 days) +
+#             "Last read: <timestamp>" footer + "⟳" manual refresh button.
+#             Color states: normal (LN2_C sky blue) / stale >18h (YL yellow) / level
+#             ≤20 in (RD red, takes priority over stale). New "LN2 Supply" QGroupBox
+#             in the left status panel, after Shutter Controls.
+#             _LN2Bridge(QObject) pyqtSignal bridges LN2Monitor's background threads to
+#             the main thread (same BUG 7/20 pattern as _RecipeBridge).
+#
+#   Repo hygiene:
+#             .gitignore added (secrets/, logs/, __pycache__/, build/, dist/, etc., and
+#             *.har) — did not exist before; secrets/ln2_creds.dat and any future HAR
+#             capture must never be committed.
+#             requirements.txt: added requests>=2.28.0 (used for the real HTTP scraper,
+#             confirmed already installed in the project's Anaconda env).
+#             apdirect.airproducts.com.har (user-supplied, contained the real plaintext
+#             APDirect password — HAR captures raw POST bodies) was deleted by the user
+#             after the login/API flow was learned from a redacted summary. Flagged
+#             because it briefly sat inside the Box-synced project folder.
+#
+#   Context file: new Section 18, file tree (devices/ln2_monitor.py, tools/,
+#             secrets/), dependencies list, and this changelog entry.
 #
 ################################################################################

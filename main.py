@@ -18,6 +18,7 @@ sys.path.insert(0, _BASE)
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import Qt
 from gui_app import MainWindow, apply_dark_theme
+import wheel_guard
 
 
 def main():
@@ -34,6 +35,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Vac Deposition Control")
     apply_dark_theme(app)
+    wheel_guard.install(app)          # mouse wheel never changes spin boxes / dropdowns / sliders
 
     window = MainWindow()
     screen = app.primaryScreen().availableGeometry()

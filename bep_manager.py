@@ -124,6 +124,67 @@ class BEPManager:
         except Exception: pass
         self._set_state(self.STATE_ABORTED)
 
+    def measure_sync(self, source: str = "Both",
+                     should_stop: Optional[Callable[[], bool]] = None) -> List[BEPRecord]:
+        """Blocking BEP measurement of "In", "Se" or "Both" → the BEPRecords taken.
+
+        Unlike start_measurement() this runs on the CALLING thread, so a recipe
+        MEASURE_BEP step waits for the result instead of racing past it. Each
+        record's full trace stays available as self.trace_in / self.trace_se.
+
+        should_stop: polled between phases so a recipe stop can cut the sequence
+        short; mid-measurement interruption goes through abort() as usual.
+        """
+        src = str(source or "Both").strip().lower()
+        want_in = any(k in src for k in ("in", "both"))
+        want_se = any(k in src for k in ("se", "both"))
+        if "selen" in src: want_in = False          # "Selenium" contains "in"
+        if not (want_in or want_se): want_in = want_se = True
+
+        if self.shutter is None:
+            self._msg("BEP: no shutter controller — measurement skipped"); return []
+        if self._thread and self._thread.is_alive():
+            self._msg("BEP: a measurement is already running — skipped"); return []
+
+        def _halt(): return self._stop.is_set() or bool(should_stop and should_stop())
+
+        self._stop.clear()
+        out: List[BEPRecord] = []
+        try:
+            if want_in and not _halt():
+                self._msg("Measuring Indium BEP...")
+                r = self._measure_source("In", self._get_in_temp(),
+                                         open_fn=self.shutter.in_open,
+                                         close_fn=self.shutter.in_close)
+                if r: self.last_in_bep = r.bep; out.append(r)
+
+            if want_in and want_se and not _halt():
+                self._msg(f"Waiting {SETTLE_TIME:.0f} s for pressure to stabilize...")
+                self._set_state(self.STATE_SETTLE)
+                self._wait_with_progress(SETTLE_TIME, label="Settle")
+
+            if want_se and not _halt():
+                se_t = self._get_se_temp()
+                self._msg(f"Measuring Selenium BEP (T={se_t:.1f}°C)...")
+                r = self._measure_source("Se", se_t,
+                                         open_fn=self.shutter.se_open,
+                                         close_fn=self.shutter.se_close)
+                if r: self.last_se_bep = r.bep; out.append(r)
+
+            self._set_state(self.STATE_DONE if out else self.STATE_ABORTED)
+            if out and self.on_complete: self.on_complete()
+        except Exception as e:
+            self._msg(f"BEP error: {e}")
+            self._set_state(self.STATE_ABORTED)
+            try:
+                if self.shutter: self.shutter.both_close()
+            except Exception: pass
+        return out
+
+    def trace_for(self, source: str) -> Optional[BEPTrace]:
+        """Latest annotated trace for "In" or "Se"."""
+        return self.trace_in if str(source).strip().lower().startswith("in") else self.trace_se
+
     @property
     def se_in_ratio(self) -> Optional[float]:
         if self.last_se_bep and self.last_in_bep and self.last_in_bep > 0:

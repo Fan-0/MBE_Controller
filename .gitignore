@@ -1,0 +1,22 @@
+# Python / build output
+__pycache__/
+*.pyc
+build/
+dist/
+
+# Credentials — encrypted or not, never in git (CONTEXT Section 18)
+secrets/
+
+# Logs & data (logs live in ~/Box/logs or the local logs/ fallback — log_paths.py)
+logs/
+bep_log.csv
+*.MP4
+*.mp4
+*.avi
+*.mov
+*.MOV
+
+# Office lock files, OS / editor clutter
+~$*
+desktop.ini
+.vscode/

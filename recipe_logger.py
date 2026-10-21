@@ -43,6 +43,14 @@ class RecipeLogger:
         self.bep_ratio     = None
         self.bep_trace_in  = None   # BEPTrace — annotated fast trace for Indium
         self.bep_trace_se  = None   # BEPTrace — annotated fast trace for Selenium
+        # One entry per in-recipe MEASURE_BEP: (BEPRecord, BEPTrace, elapsed_s).
+        # Exported as sheets bep_measure_rec_1, _2, … so a calibration run's
+        # temperature/flux points each keep their own full trace.
+        self.bep_runs: List[tuple] = []
+        # In-recipe RHEED_VIDEO clips: dicts {n, file, meta, start, duration_s, frames,
+        # sub_temp_c, se_in_ratio, step, elapsed_s} → "RHEED clips" sheet
+        self.rheed_clips: List[dict] = []
+        self.run_stamp = ""         # set by start(): the run's ONE timestamp (see run_name)
         self.recipe_steps  = []     # list of RecipeStep
 
         self.brax    = None
@@ -61,10 +69,37 @@ class RecipeLogger:
 
     # ── Control ──────────────────────────────────────────────────────
 
+    def add_bep_measurement(self, results):
+        """Record one in-recipe MEASURE_BEP step (called from the recipe thread).
+
+        `results` is [(BEPRecord, BEPTrace), …] — a "Both" sweep passes In and Se
+        in together so the pair shares a single bep_measure_rec_# sheet.
+        """
+        el = round(time.time() - self._start_time, 1) if self._start_time else 0.0
+        self.bep_runs.append((list(results), el))
+
+    @property
+    def safe_sample(self) -> str:
+        return "".join(c if c.isalnum() or c in "-_" else "_" for c in self.sample_name)
+
+    @property
+    def run_name(self) -> str:
+        """<run start stamp>_<sample> — names BOTH the run .xlsx and the run's RHEED folder
+        (2026-10-21; the .xlsx used to be stamped at EXPORT time, so it could not match)."""
+        return f"{self.run_stamp or datetime.now().strftime('%Y%m%d_%H%M%S')}_{self.safe_sample}"
+
+    def add_rheed_clip(self, entry: dict):
+        """Record one in-recipe RHEED_VIDEO clip (called from the recipe thread)."""
+        e = dict(entry)
+        e["elapsed_s"] = round(time.time() - self._start_time, 1) if self._start_time else 0.0
+        self.rheed_clips.append(e)
+
     def start(self, sample_name: str = "sample"):
         self.sample_name = sample_name
         self._rows_pressure = []; self._rows_temp = []; self._rows_shutter = []
+        self.bep_runs = []; self.rheed_clips = []
         self._start_time = time.time()
+        self.run_stamp = datetime.fromtimestamp(self._start_time).strftime("%Y%m%d_%H%M%S")
         self._stop.clear(); self.running = True
         self._thread = threading.Thread(target=self._loop, daemon=True, name="RecLog")
         self._thread.start()
@@ -117,9 +152,7 @@ class RecipeLogger:
         if not HAS_OPENPYXL:
             return None
 
-        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in self.sample_name)
-        filename = os.path.join(out_dir, f"{ts_str}_{safe_name}.xlsx")
+        filename = os.path.join(out_dir, f"{self.run_name}.xlsx")   # = the RHEED folder name
 
         wb = openpyxl.Workbook()
 
@@ -298,6 +331,83 @@ class RecipeLogger:
 
             ws5.column_dimensions["A"].width = 22; ws5.column_dimensions["B"].width = 18
             ws5.column_dimensions["D"].width = 22; ws5.column_dimensions["E"].width = 18
+
+        # ── One sheet per in-recipe MEASURE_BEP: bep_measure_rec_1, _2, … ─
+        for i, entry in enumerate(self.bep_runs, start=1):
+            try:
+                results, el = entry
+            except (TypeError, ValueError):
+                continue
+            if not results:
+                continue
+            # A "Both" sweep arrives as two records; they share this one sheet,
+            # In in columns A/B and Se in D/E (same layout as BEP Fast Trace).
+            by_src = {}
+            for rec, tr in results:
+                key = "In" if str(getattr(rec, "source", "")).strip().lower().startswith("in") else "Se"
+                by_src[key] = (rec, tr)
+
+            wsb = wb.create_sheet(f"bep_measure_rec_{i}")
+            wsb["A1"] = f"BEP Measurement #{i} — " + " + ".join(k for k in ("In", "Se") if k in by_src)
+            wsb["A1"].font = Font(bold=True, color="ffb86c", size=13)
+            _v(wsb["A2"], "Run elapsed (s)"); wsb["B2"].value = el
+
+            def _num(v): return v if isinstance(v, (int, float)) else None
+            for key, c0, accent, label in (("In", 1, "ffb86c", "Indium"),
+                                           ("Se", 4, "bd93f9", "Selenium")):
+                if key not in by_src: continue
+                rec, tr = by_src[key]
+                hc = wsb.cell(4, c0); hc.value = label
+                hc.font = Font(bold=True, color=accent, size=11)
+                r = 5
+                for lbl, val in (("Source Temp (°C)",    getattr(rec, "temp_c", None)),
+                                 ("BEP (Torr)",          getattr(rec, "bep", None)),
+                                 ("Peak (top-50% mean)", getattr(rec, "peak", None)),
+                                 ("Baseline (mean)",     getattr(rec, "baseline", None))):
+                    _v(wsb.cell(r, c0), lbl); wsb.cell(r, c0+1).value = _num(val); r += 1
+                _v(wsb.cell(r, c0), "Timestamp")
+                _v(wsb.cell(r, c0+1), getattr(rec, "timestamp", "")); r += 1
+                if tr is not None:
+                    _v(wsb.cell(r, c0), "Open window (s)")
+                    _v(wsb.cell(r, c0+1), f"{tr.open_start_t:.1f} – {tr.open_end_t:.1f}")
+
+            DR = 12; chart_row = DR
+            for key, c0 in (("In", 1), ("Se", 4)):
+                if key not in by_src: continue
+                rec, tr = by_src[key]
+                samples = list(getattr(tr, "samples", []) or [])
+                _h(wsb.cell(DR, c0), f"{key}: Time (s)")
+                _h(wsb.cell(DR, c0+1), f"{key}: Pressure (Torr)")
+                for j, (t_rel, p) in enumerate(samples):
+                    wsb.cell(DR+1+j, c0).value = round(t_rel, 3)
+                    wsb.cell(DR+1+j, c0+1).value = p
+                if len(samples) > 1:
+                    ch = LineChart(); ch.title = f"{key} BEP trace #{i}"; ch.style = 10
+                    ch.y_axis.title = "Pressure (Torr)"; ch.x_axis.title = "Time (s)"
+                    ch.width = 18; ch.height = 11
+                    ch.series.append(_make_series(wsb, c0+1, DR, DR + len(samples)))
+                    ch.set_categories(Reference(wsb, min_col=c0, min_row=DR+1, max_row=DR+len(samples)))
+                    wsb.add_chart(ch, f"G{chart_row}"); chart_row += 22
+            for col, wdt in (("A", 22), ("B", 18), ("D", 22), ("E", 18)):
+                wsb.column_dimensions[col].width = wdt
+
+        # ── RHEED clips recorded by RHEED_VIDEO steps ─────────────────
+        if self.rheed_clips:
+            wr = wb.create_sheet("RHEED clips")
+            wr["A1"] = "RHEED clips (recipe RHEED_VIDEO) — files in the run's RHEED folder"
+            wr["A1"].font = Font(bold=True, color="8be9fd", size=13)
+            cols = [("#", "n"), ("Step", "step"), ("Run elapsed (s)", "elapsed_s"),
+                    ("Start", "start"), ("Length (s)", "duration_s"), ("Frames", "frames"),
+                    ("Sub T (°C)", "sub_temp_c"), ("Se/In BEP ratio", "se_in_ratio"),
+                    ("Video / image", "file"), ("Metadata", "meta"), ("Folder", "folder")]
+            for j, (hd, _) in enumerate(cols, start=1):
+                _h(wr.cell(3, j), hd)
+            for i, c in enumerate(self.rheed_clips, start=4):
+                for j, (_, key) in enumerate(cols, start=1):
+                    v = c.get(key)
+                    wr.cell(i, j).value = v if isinstance(v, (int, float)) or v is None else str(v)
+            for col, wdt in zip("ABCDEFGHIJK", (5, 6, 14, 20, 10, 8, 10, 14, 48, 48, 60)):
+                wr.column_dimensions[col].width = wdt
 
         wb.save(filename)
         return filename

@@ -5,6 +5,7 @@ A LabVIEW-style Python/PyQt5 GUI for controlling a vacuum deposition tool with:
 - **HEAT3** dual-loop heating power supply (Modbus RTU) — CH1=Selenium, CH2=Substrate
 - **EPC3004** single-loop PID controller (Eurotherm, Modbus RTU) — Indium evaporation source (Type C TC via J-proxy)
 - **Arduino** shutter controller (Serial, 2 sources: Indium + Selenium)
+- **LN2 dewar level tracker** — logs into Air Products APDirect twice daily (or on demand) and shows a live fill graphic + trend plot
 
 ---
 
@@ -44,6 +45,18 @@ python diagnostics/configure_epc3004_cstm1.py --port COM13 --check-regs
 
 After this one-time setup the app reads and writes true Type C temperatures (0–2300°C)
 transparently. See **Type C Thermocouple (J-Proxy)** section below for details.
+
+### 6. (First time only, optional) Set up the LN2 dewar monitor
+
+Run this **yourself, in your own terminal** — it asks for your Air Products APDirect
+password with hidden input, so it must be interactive:
+
+```bash
+python tools\setup_ln2_credentials.py
+```
+
+See **LN2 Dewar Monitor** section below for what this does and how the panel behaves.
+Skip this step if you don't need LN2 tracking — the rest of the app works fine without it.
 
 ---
 
@@ -126,6 +139,7 @@ Recipes are Excel (`.xlsx`) files with the following columns:
 |-------------------|-------------------------------------------------------------|------------------|-------------------------------------------------|
 | `SET_TEMP`        | `Selenium (CH1)`, `Substrate (CH2)`, or `Indium (EPC)`      | °C target        | Jump SP to target immediately                   |
 | `RAMP_TEMP`       | `Selenium (CH1)`, `Substrate (CH2)`, or `Indium (EPC)`      | °C/min rate      | Set device-internal SP ramp rate                |
+| `INCREASE_TEMP`   | `Selenium (CH1)`, `Substrate (CH2)`, or `Indium (EPC)`      | Δ°C step         | SP += Param2 (negative steps down). Relative to the **setpoint**, not the live PV, so repeated passes land on exact temperatures |
 | `WAIT_TEMP`       | `Selenium (CH1)`, `Substrate (CH2)`, or `Indium (EPC)`      | ±°C tolerance    | Wait until PV within ±Param2 of SP              |
 | `WAIT_PRESSURE`   | Torr target                                                 | —                | Wait until IG ≤ Param1                          |
 | `WAIT_TIME`       | seconds                                                     | —                | Wait for Param1 seconds                         |
@@ -135,8 +149,34 @@ Recipes are Excel (`.xlsx`) files with the following columns:
 | `HEATER_OFF`      | `Selenium (CH1)`, `Substrate (CH2)`, or `Indium (EPC)`      | —                | Device → STANDBY state                          |
 | `IG_ON`           | —                                                           | —                | Turn ion gauge ON                               |
 | `IG_OFF`          | —                                                           | —                | Turn ion gauge OFF                              |
+| `MEASURE_BEP`     | `In`, `Se`, or `Both`                                       | —                | Run a BEP measurement inline and **block until it finishes** (~10 s per source, ~50 s for `Both` incl. settle). Each result is saved to its own sheet in the run log |
 | `GOTO`            | step# to jump to                                            | loop count       | Loop: executes loop count+1 times total         |
 | `END`             | —                                                           | —                | Terminate recipe cleanly                        |
+
+### Flux Calibration Example (temperature vs BEP)
+
+`INCREASE_TEMP` + `MEASURE_BEP` + `GOTO` produce a temperature-vs-flux sweep unattended:
+
+```
+Step 1  RAMP_TEMP      Selenium (CH1)  30    Se ramp rate 30°C/min
+Step 2  SET_TEMP       Selenium (CH1)  200   Start of sweep
+Step 3  WAIT_TEMP      Selenium (CH1)  3     Settle within ±3°C
+Step 4  MEASURE_BEP    Se              —     Flux point at this temperature
+Step 5  INCREASE_TEMP  Selenium (CH1)  20    Step +20°C
+Step 6  GOTO           3               7     8 points total (200…340°C)
+Step 7  HEATER_OFF     Selenium (CH1)  —     Cool down
+```
+
+Each `MEASURE_BEP` **step** writes one **`bep_measure_rec_#`** sheet (`_1`, `_2`, … in
+execution order) into the run's `.xlsx`, holding that point's source, temperature,
+baseline, peak, BEP, run-elapsed time and the full 20 Hz pressure trace plus a chart.
+A `Both` sweep is a single measurement, so In and Se share one sheet — In in columns
+A/B, Se in D/E, with a chart for each. The same records are
+also appended to the cumulative `bep_log.csv`, which is the quickest place to pull a
+temperature-vs-flux curve across runs.
+
+> **Note:** `MEASURE_BEP` opens the shutter for its measurement, so don't place one
+> inside a window where you need the shutter held in a particular state.
 
 ### RAMP_TEMP Example
 ```
@@ -167,6 +207,36 @@ python recipes/create_recipe_template.py
 
 ---
 
+## Standalone Recipe Editor
+
+`recipe_editor.py` is a **separate, lightweight app** for building and editing
+recipe `.xlsx` files. It has the same recipe table, action dropdowns, drag-drop
+reordering, and estimated-timeline preview plot as the main app's Recipe tab,
+but has **no dependency on hardware, pyserial, or minimalmodbus** — it only
+needs PyQt5, pyqtgraph, and openpyxl. This makes it safe to hand to lab
+members so they can write and validate recipes ahead of time on their own
+laptop, with no vacuum system attached, then bring the `.xlsx` file to the lab
+PC and load it into the main app via **File > Load Recipe**.
+
+Run it directly:
+```bash
+python recipe_editor.py
+```
+
+Or build it into its own standalone executable:
+```bash
+pip install pyinstaller PyQt5 pyqtgraph openpyxl
+pyinstaller recipe_editor.spec
+```
+The output is `dist/RecipeEditor/RecipeEditor.exe` — zip up the `RecipeEditor`
+folder and share it; recipients don't need Python installed at all.
+
+Files it produces are byte-for-byte the same 5-column format described above,
+so anything saved here loads straight into the main VacDepositionControl app
+(and vice versa).
+
+---
+
 ## Type C Thermocouple (J-Proxy)
 
 The EPC3004 has no native Type C support. The **J-proxy method** works as follows:
@@ -193,6 +263,63 @@ The full 16-point table is in `manuals/type_c_via_j_proxy.csv`.
 
 ---
 
+## LN2 Dewar Monitor
+
+Tracks the liquid nitrogen level for tank **52228** on the Air Products **APDirect**
+portal (`apdirect.airproducts.com`). Shown as a panel in the left status column
+("LN2 Supply"): a vertical fill graphic for the current level next to a time-series
+plot of recent history, a **Last read:** timestamp, and a manual **⟳** refresh button.
+
+### Setup (one-time, optional)
+
+```bash
+python tools\setup_ln2_credentials.py
+```
+
+Run this **yourself, directly, in your own terminal** — never through an assistant or
+script — because the password prompt uses hidden input (`getpass`), which is what keeps
+the plaintext password from ever appearing anywhere outside your own terminal session.
+It encrypts your APDirect username/password with **Windows DPAPI**, tied to your Windows
+account on this PC, and writes `secrets/ln2_creds.dat` (gitignored — never committed).
+Nothing in the app ever logs, prints, or displays the decrypted credentials. Re-run the
+script any time to rotate/replace them.
+
+### How it updates
+
+- **Automatic:** checks twice daily (default 08:00 / 20:00 local time) while the app is
+  running, plus one catch-up check on startup if the last known reading is already stale.
+  This is in-app only (no Windows Scheduled Task) — if the app is closed at a scheduled
+  time, that check is simply skipped until the next one.
+- **Manual:** click **⟳** on the panel at any time.
+
+### Panel states
+
+| State | Trigger | Visual |
+|-------|---------|--------|
+| OK | Reading is recent and above the low threshold | Sky-blue border/fill |
+| Stale | No successful reading in the last 18 hours | Yellow border — "reading not recent" |
+| Low | Last known level ≤ 20 in | Red border/fill (takes priority over stale) |
+
+The fill bar's 100% reference is the tank's real full-scale value, read live from the
+APDirect API per fetch (confirmed 46 in for tank 52228) — not a hardcoded guess.
+
+### Data source
+
+`devices/ln2_monitor.py` logs into `account.airproducts.com`, then reads
+`Tanks/API/v1/ShipToList` (current reading + full-scale value) and
+`Tanks/API/v1/GetEquipmentReadings` (history backfill, deduplicated on merge) from
+`apdirect.airproducts.com`. History is cached to `logs/ln2_history.csv` so the trend
+plot survives an app restart. Any failure (bad credentials, network issue, site layout
+change) fails safely — the panel shows its stale/yellow state rather than crashing or
+guessing a value.
+
+> **HAR captures:** if you ever need to re-capture a browser DevTools HAR to debug this
+> (e.g. after a site change), delete the `.har` file as soon as you're done with it — it
+> contains your real password in plaintext (HAR records raw POST bodies) and is
+> gitignored (`*.har`) but not encrypted at rest.
+
+---
+
 ## Building an EXE
 
 ```bash
@@ -201,6 +328,8 @@ pyinstaller build.spec
 ```
 
 The output is in `dist/VacControl/VacControl.exe`.
+
+For the hardware-free recipe builder, see [Standalone Recipe Editor](#standalone-recipe-editor) above (`recipe_editor.spec`).
 
 ---
 
@@ -211,6 +340,8 @@ vac_control/
 ├── main.py                    # Entry point
 ├── gui_app.py                 # Main PyQt5 window (timers, poller, plots)
 ├── recipe_engine.py           # Recipe state machine
+├── recipe_editor.py           # Standalone recipe builder (no hardware deps)
+├── recipe_editor.spec         # PyInstaller config for RecipeEditor.exe
 ├── recipe_logger.py           # 1Hz run logger → .xlsx export
 ├── data_logger.py             # CSV logger + deque plot buffers (fed via feed())
 ├── bep_manager.py             # BEP measurement workflow (20Hz IG sampling)
@@ -221,8 +352,13 @@ vac_control/
 │   ├── brax3400.py            # BRAX 3400 RS485 driver (read_until \r)
 │   ├── arduino_shutter.py     # Arduino serial driver + firmware string
 │   ├── epc3004.py             # Eurotherm EPC3004 PID driver (Indium source)
+│   ├── ln2_monitor.py         # LN2 dewar level tracker (Air Products APDirect)
 │   ├── sim_devices.py         # Sim devices for test mode (incl. EPC3004Sim)
 │   └── __init__.py
+├── tools/
+│   └── setup_ln2_credentials.py  # One-time LN2 credential setup (run manually, not via app)
+├── secrets/                   # Gitignored; DPAPI-encrypted credentials only, never plaintext
+│   └── ln2_creds.dat          # Created by tools/setup_ln2_credentials.py
 ├── diagnostics/
 │   ├── timing_diag.py               # Poll-cycle timing benchmark ← run to verify hw perf
 │   ├── plot_diag.py                 # GUI plot pipeline diagnostic ← run to verify plot perf
@@ -230,7 +366,7 @@ vac_control/
 │   ├── heat3_remote_test.py         # PREVAC V2 remote-enable diagnostic
 │   ├── heat3_remote_watchdog.py     # Remote watchdog simulator
 │   └── configure_epc3004_cstm1.py  # EPC3004 Type C TC setup (J-proxy, one-time)
-├── logs/                      # Auto-created; all CSV + Excel output goes here
+├── logs/                      # Auto-created; all CSV + Excel output goes here (incl. ln2_history.csv)
 ├── recipes/
 │   ├── create_recipe_template.py  # Generates a sample recipe
 │   ├── recipe.xlsx / *.xlsx   # Saved recipes
@@ -242,6 +378,7 @@ vac_control/
 │   └── type_c_lin16_v2.csv     # ASTM E988 Type C reference table (16-point, 0–2300°C)
 ├── requirements.txt
 ├── build.spec                 # PyInstaller config
+├── .gitignore                 # secrets/, logs/, *.har, build artifacts
 └── README.md
 ```
 

@@ -3,6 +3,7 @@ Recipe Engine — updated to support:
   SET_TEMP   param1 = "Se" | "Selenium" | "Substrate" | "In"  (or legacy float for CH1)
   OPEN_SHUTTER  param1 = "In" | "Se" | "Both"
   CLOSE_SHUTTER param1 = "In" | "Se" | "Both"
+  RHEED_VIDEO   param1 = clip length s (0 = still PNG) — via the GUI's rheed_capture hook
   (all original actions still work)
 """
 
@@ -34,9 +35,17 @@ class RecipeEngine:
         self.state = self.STATE_IDLE
         self.current_step_idx = 0
         self.brax = None; self.heat3 = None; self.shutter = None; self.indium = None
+        self.bep = None   # BEPManager — required by the MEASURE_BEP action
         self.on_step_change:  Optional[Callable[[int], None]] = None
         self.on_status_msg:   Optional[Callable[[str], None]] = None
         self.on_state_change: Optional[Callable[[str], None]] = None
+        # One call per MEASURE_BEP step with [(BEPRecord, BEPTrace), …] — the GUI
+        # hands it to RecipeLogger, which writes one sheet per step (so a "Both"
+        # sweep keeps In and Se together on the same sheet)
+        self.on_bep_result:   Optional[Callable[[list], None]] = None
+        # RHEED_VIDEO hook, set by the GUI: rheed_capture(duration_s, step_no, should_stop)
+        # → {"ok": bool, "msg": str}. Blocks for the clip. None → the step is skipped.
+        self.rheed_capture:   Optional[Callable[[float, int, Callable[[], bool]], dict]] = None
         self._loop_counters: Dict[int, int] = {}
         self._thread: Optional[threading.Thread] = None
         self._stop  = threading.Event()
@@ -103,6 +112,11 @@ class RecipeEngine:
 
     def stop(self):
         self._stop.set(); self._pause.set()
+        if self.bep is not None:
+            # A MEASURE_BEP step blocks the recipe thread inside the sweep;
+            # aborting closes the shutters and drops out of the sampling loops.
+            try: self.bep.abort()
+            except Exception: pass
         if self._thread: self._thread.join(timeout=3)
         self._set_state(self.STATE_IDLE); self.current_step_idx = 0
 
@@ -213,6 +227,74 @@ class RecipeEngine:
             if self.heat3:
                 ok = self.heat3.apply_setpoint(ch, temp)["ok"]
                 self._log(f"  → CH{ch} setpoint {'✓' if ok else '✗'} {temp}°C")
+
+        elif a == "INCREASE_TEMP":
+            # p1 = source, p2 = Δ°C (negative steps down).
+            # Relative to the SETPOINT rather than the live PV, so a calibration
+            # staircase lands on exact repeatable temperatures and rounding does
+            # not accumulate across passes of a GOTO loop.
+            if p2 is None: self._log("INCREASE_TEMP: need Δ°C in Param2"); return None
+            delta = float(p2)
+            if self._is_indium_src(p1):
+                if not self.indium:
+                    self._log("  ⚠ INCREASE_TEMP Indium: no EPC3004 device — skipping"); return 1
+                cur = self.indium.ch1_read_setpoint()
+                if cur is None: cur = self.indium.ch1_read_process_value()
+                if cur is None:
+                    self._log("  ✗ INCREASE_TEMP: cannot read Indium setpoint"); return None
+                tgt = cur + delta
+                ok = self.indium.apply_setpoint(1, tgt)["ok"]
+                self._log(f"  → Indium SP {cur:.1f} → {tgt:.1f}°C (Δ{delta:+.1f}) {'✓' if ok else '✗'}")
+                return 1
+            ch = self._src_to_ch(p1)
+            if not self.heat3:
+                self._log("  ⚠ INCREASE_TEMP: no HEAT3 device — skipping"); return 1
+            sp_fn = getattr(self.heat3, f"ch{ch}_read_setpoint", None)
+            pv_fn = getattr(self.heat3, f"ch{ch}_read_process_value", None)
+            cur = sp_fn() if sp_fn else None
+            if cur is None and pv_fn: cur = pv_fn()
+            if cur is None:
+                self._log(f"  ✗ INCREASE_TEMP: cannot read CH{ch} setpoint"); return None
+            tgt = cur + delta
+            ok = self.heat3.apply_setpoint(ch, tgt)["ok"]
+            self._log(f"  → CH{ch} SP {cur:.1f} → {tgt:.1f}°C (Δ{delta:+.1f}) {'✓' if ok else '✗'}")
+
+        elif a == "MEASURE_BEP":
+            # p1 = "In" | "Se" | "Both". Blocks the recipe until the sweep ends,
+            # so a calibration loop can step temperature → settle → measure → GOTO.
+            if self.bep is None:
+                self._log("  ⚠ MEASURE_BEP: no BEP manager assigned — skipping"); return 1
+            src = str(p1).strip() if p1 else "Both"
+            self._log(f"  🔬 MEASURE_BEP ({src}) — waiting for the sweep to finish…")
+            recs = self.bep.measure_sync(src, should_stop=lambda: self._stop.is_set())
+            if not recs and not self._stop.is_set():
+                self._log("  ⚠ MEASURE_BEP: no result recorded")
+            for r in recs:
+                self._log(f"  🔬 {r.source} BEP = {r.bep:.3e} Torr @ {r.temp_c:.1f}°C")
+            if recs and self.on_bep_result:
+                # Fires once per MEASURE_BEP step, not once per source: a "Both"
+                # sweep is a single measurement and belongs on a single sheet.
+                try: self.on_bep_result([(r, self.bep.trace_for(r.source)) for r in recs])
+                except Exception as e: self._log(f"  BEP log error: {e}")
+
+        elif a == "RHEED_VIDEO":
+            # p1 = clip length (s); 0 = one still PNG. BLOCKS for the clip (like
+            # WAIT_TIME) using whatever camera is connected on the 📡 RHEED tab. Each
+            # execution writes the NEXT numbered clip (_001, _002 …) so GOTO loops
+            # never overwrite. No camera / no hook → skip with a warning (never an
+            # ERROR: a missing camera must not abort a deposition).
+            if p1 is None: self._log("RHEED_VIDEO: need the clip length (s) in Param1"); return None
+            try: dur = float(p1)
+            except (TypeError, ValueError): self._log(f"RHEED_VIDEO: bad length {p1!r}"); return None
+            if self.rheed_capture is None:
+                self._log("  ⚠ RHEED_VIDEO: no RHEED panel — skipping"); return 1
+            self._log(f"  📡 RHEED_VIDEO {dur:g} s…" if dur > 0 else "  📡 RHEED_VIDEO: still snapshot")
+            try:
+                res = self.rheed_capture(dur, step.step, lambda: self._stop.is_set()) or {}
+            except Exception as e:
+                res = {"ok": False, "msg": f"RHEED capture error: {e}"}
+            self._log(("  " if res.get("ok") else "  ⚠ ") + str(res.get("msg", "")))
+            if self._stop.is_set(): return None
 
         elif a == "WAIT_TEMP":
             # p1 = channel name (e.g. "Selenium (CH1)") OR legacy float tolerance

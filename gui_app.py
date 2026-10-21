@@ -3,17 +3,17 @@ Vacuum Deposition Control GUI
 
 Devices
 -------
-BRAX3400    Ion gauge controller (Modbus RTU, RS-485, COM11 default)
-HEAT3       Dual-loop PID heater (Modbus RTU, RS-485, COM12 default)
+BRAX3400    Ion gauge controller (Modbus RTU, RS-485, COM3 default)
+HEAT3       Dual-loop PID heater (Modbus RTU, RS-485, COM6 default)
               CH1 = Selenium source   CH2 = Substrate heater
               poll_all() → 3 batch FC 0x03 reads (faster than 8 individual)
               apply_setpoint() → 2 FC 0x06 writes + readback + log
               debug_callback → prints raw TX/RX hex to System Log when Debug ON
 EPC3004     Eurotherm single-loop PID for Indium evaporation source
-              Modbus RTU, RS-485, 19200 baud 8N1, COM13 default
+              Modbus RTU, RS-485, 19200 baud 8N1, COM7 default
               poll_all() → returns in_pv, in_sp, in_op, in_out
               apply_setpoint() / go_operate() / go_standby() / write_ramp_rate()
-Arduino     Dual-shutter controller (serial, COM7 default)
+Arduino     Dual-shutter controller (serial, COM5 default)
               in_open/in_close/se_open/se_close/both_open/both_close
 
 Test mode
@@ -79,6 +79,7 @@ Exports to Excel: Run Info, Pressure, Temperature (with In_C column), BEP sheets
 """
 
 import sys, os, math, time, threading, types
+from datetime import datetime
 import numpy as np
 from typing import Optional
 
@@ -90,8 +91,8 @@ from PyQt5.QtWidgets import (
     QTabWidget, QMessageBox, QDialog, QFormLayout, QDialogButtonBox,
     QInputDialog, QLineEdit, QCheckBox, QAbstractItemView,
 )
-from PyQt5.QtCore  import Qt, QTimer, QThread, QObject, pyqtSignal
-from PyQt5.QtGui   import QFont, QColor, QPalette, QPainter, QPen, QBrush
+from PyQt5.QtCore  import Qt, QTimer, QThread, QObject, pyqtSignal, QRectF
+from PyQt5.QtGui   import QFont, QColor, QPalette, QPainter, QPen, QBrush, QPainterPath
 
 try:
     import pyqtgraph as pg
@@ -102,39 +103,77 @@ except ImportError:
 try:
     import serial.tools.list_ports as _lp
     def list_ports(): return sorted(p.device for p in _lp.comports())
+    def port_descriptions():
+        """{"COM3": "Intel(R) Active Management Technology - SOL (COM3)", …} — shown as
+        tooltips: on the lab laptop COM3 is Intel AMT and COM4/5/6/10 are Bluetooth
+        links, so a wrong pick is visible (opening a Bluetooth COM can hang for seconds)."""
+        return {p.device: (p.description or p.device) for p in _lp.comports()}
 except Exception:
     def list_ports(): return [f"COM{i}" for i in range(1,13)]
+    def port_descriptions(): return {}
 
 from devices        import BRAX3400, HEAT3, ArduinoShutter, EPC3004
 from devices        import BRAX3400Sim, HEAT3Sim, ArduinoShutterSim, EPC3004Sim
 from recipe_engine  import RecipeEngine
 from recipe_logger  import RecipeLogger
 from data_logger    import DataLogger
-from bep_manager    import BEPManager, INDIUM_TEMP_C
+from bep_manager    import (BEPManager, INDIUM_TEMP_C,
+                            BASELINE_DURATION, OPEN_DURATION, SETTLE_TIME)
+from devices.ln2_monitor import LN2Monitor, STALE_HOURS, LOW_LEVEL_IN, HISTORY_PATH as _LN2_OLD
+import bep_manager as _bep_mod
+import log_paths
 
 # ── Paths ─────────────────────────────────────────────────────────────
-_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+# All logs: log_paths — <LOG_ROOT>/system (pressure CSV, LN2, BEP history) and
+# <LOG_ROOT>/deposition (run .xlsx); LOG_ROOT = ~/Box/logs when Box Drive is present.
+_LOG_DIR = log_paths.DEPOSITION_DIR
+# cumulative histories move to <LOG_ROOT>/system; the old files are copied once
+_bep_mod.BEP_CSV_FILE = log_paths.system_file(
+    "bep_log.csv", legacy=os.path.join(log_paths.app_dir(), "bep_log.csv"))
 
 # ── Palette ───────────────────────────────────────────────────────────
 BG="#1e1e2e"; PBG="#2a2a3e"; BDR="#44446a"
 BL="#5e9cf3"; GR="#50fa7b"; RD="#ff5555"; OR="#ffb86c"; PU="#bd93f9"
 FG="#cdd6f4"; DIM="#6c7086"; SIM_C="#ff9f1c"; IN_C="#8be9fd"  # cyan — Indium EPC3004
+# Source colour coding, shared by the shutter bands and the BEP window labels
+SRC_IN_C="#22ee44"   # Indium — green
+SRC_SE_C="#ee6622"   # Selenium — orange
+BEP_C   ="#c0c0c0"   # MEASURE_BEP window — silver
+YL="#f1fa8c"    # yellow — stale / "not recent" highlight (also used for active recipe row text)
+LN2_C="#8ecae6" # sky blue — LN2 dewar accent
 
 # Actions that get a param1 source dropdown
 ACTION_CH_OPTS     = {
-    "SET_TEMP":   ["Selenium (CH1)", "Substrate (CH2)", "Indium (EPC)"],
-    "RAMP_TEMP":  ["Selenium (CH1)", "Substrate (CH2)", "Indium (EPC)"],
-    "WAIT_TEMP":  ["Selenium (CH1)", "Substrate (CH2)", "Indium (EPC)"],
-    "HEATER_ON":  ["Selenium (CH1)", "Substrate (CH2)", "Indium (EPC)"],
-    "HEATER_OFF": ["Selenium (CH1)", "Substrate (CH2)", "Indium (EPC)"],
+    "SET_TEMP":      ["Selenium (CH1)", "Substrate (CH2)", "Indium (EPC)"],
+    "RAMP_TEMP":     ["Selenium (CH1)", "Substrate (CH2)", "Indium (EPC)"],
+    "INCREASE_TEMP": ["Selenium (CH1)", "Substrate (CH2)", "Indium (EPC)"],
+    "WAIT_TEMP":     ["Selenium (CH1)", "Substrate (CH2)", "Indium (EPC)"],
+    "HEATER_ON":     ["Selenium (CH1)", "Substrate (CH2)", "Indium (EPC)"],
+    "HEATER_OFF":    ["Selenium (CH1)", "Substrate (CH2)", "Indium (EPC)"],
 }
-ACTION_SHUTTER_OPTS= {"OPEN_SHUTTER":["In","Se","Both"],"CLOSE_SHUTTER":["In","Se","Both"]}
+ACTION_SHUTTER_OPTS= {"OPEN_SHUTTER":["In","Se","Both"],"CLOSE_SHUTTER":["In","Se","Both"],
+                      "MEASURE_BEP":["In","Se","Both"]}
 
 ALL_ACTIONS = [
-    "SET_TEMP","RAMP_TEMP","WAIT_TEMP","WAIT_PRESSURE","WAIT_TIME",
+    "SET_TEMP","RAMP_TEMP","INCREASE_TEMP","WAIT_TEMP","WAIT_PRESSURE","WAIT_TIME",
     "OPEN_SHUTTER","CLOSE_SHUTTER",
-    "IG_ON","IG_OFF","HEATER_ON","HEATER_OFF","GOTO","END",
+    "IG_ON","IG_OFF","HEATER_ON","HEATER_OFF","MEASURE_BEP","RHEED_VIDEO","GOTO","END",
 ]
+
+
+def bep_duration(src) -> float:
+    """Wall-clock a MEASURE_BEP step costs, for the preview timeline estimate."""
+    one = BASELINE_DURATION + OPEN_DURATION
+    return one*2 + SETTLE_TIME if "both" in str(src or "both").lower() else one
+
+def fmt_duration(sec):
+    """Compact human duration: '45s', '12m 30s', '2h 05m'."""
+    sec = int(max(0, round(sec)))
+    h, rem = divmod(sec, 3600); m, s = divmod(rem, 60)
+    if h: return f"{h}h {m:02d}m"
+    if m: return f"{m}m {s:02d}s"
+    return f"{s}s"
+
 
 def apply_dark_theme(app):
     app.setStyle("Fusion"); p = QPalette()
@@ -168,11 +207,14 @@ class PressBox(QFrame):
         self._e=QLabel(""); self._e.setFont(QFont("Arial",8)); self._e.setStyleSheet(f"color:{DIM};border:none;"); self._e.setAlignment(Qt.AlignCenter)
         v.addWidget(lbl); v.addWidget(self._v); v.addWidget(self._e)
     def set_value(self,val):
+        # The exponent is the number that actually matters on a vacuum gauge
+        # (1e-6 vs 1e-9 is three decades), so it is rendered at full value-size
+        # rather than as a small superscript; the unit drops to the line below.
         if val is None: self._v.setText("N/A"); self._v.setStyleSheet(f"color:{DIM};border:none;"); self._e.setText(""); return
         if val>=1e3:    self._v.setText("OVER RNG"); self._v.setStyleSheet(f"color:{RD};border:none;"); self._e.setText(""); return
         exp=math.floor(math.log10(abs(val))) if val>0 else 0; m=val/(10**exp) if val>0 else 0
-        self._v.setText(f"{m:.2f}×10"); self._v.setStyleSheet(f"color:{BL};border:none;")
-        self._e.setText(f"{'⁺' if exp>=0 else '⁻'}{abs(exp)} Torr")
+        self._v.setText(f"{m:.2f}E{exp:+d}"); self._v.setStyleSheet(f"color:{BL};border:none;")
+        self._e.setText("Torr")
 
 class ShBtn(QPushButton):
     def __init__(self,lbl,parent=None):
@@ -303,6 +345,124 @@ class TempCh(QFrame):
         self.setStyleSheet(f"QFrame{{background:{PBG};border:{border};border-radius:7px;}}")
 
 
+class DewarFillWidget(QWidget):
+    """
+    Vertical fill visualization for the LN2 dewar: a rounded capsule shape
+    filled bottom-up in proportion to the most recent level reading.
+    Border/fill color encodes state: normal (LN2_C) / stale (YL, yellow —
+    no recent reading) / low (RD, red — level at or below LOW_LEVEL_IN).
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(30, 90)
+        self._frac = 0.0       # 0..1 fill fraction of FULL_SCALE_IN
+        self._state = "ok"     # "ok" | "stale" | "low"
+        self._have_data = False
+
+    def set_level(self, frac, state):
+        self._have_data = frac is not None
+        self._frac = 0.0 if frac is None else max(0.0, min(1.0, frac))
+        self._state = state
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        m = 3
+        rect = QRectF(m, m, w - 2*m, h - 2*m)
+        radius = min(rect.width() / 2.2, 9)
+
+        border_c = {"stale": QColor(YL), "low": QColor(RD)}.get(self._state, QColor(LN2_C))
+        pen_w = 2 if self._state in ("stale", "low") else 1
+        path = QPainterPath(); path.addRoundedRect(rect, radius, radius)
+
+        p.setPen(QPen(border_c, pen_w)); p.setBrush(QBrush(QColor(BG)))
+        p.drawPath(path)
+
+        if self._have_data and self._frac > 0:
+            fill_h = rect.height() * self._frac
+            fill_rect = QRectF(rect.left(), rect.bottom() - fill_h, rect.width(), fill_h)
+            fill_c = QColor(RD if self._state == "low" else LN2_C); fill_c.setAlpha(185)
+            p.setClipPath(path)
+            p.setPen(Qt.NoPen); p.setBrush(QBrush(fill_c))
+            p.drawRect(fill_rect)
+
+
+class LN2Panel(QFrame):
+    """
+    LN2 dewar status panel: fill graphic for the most recent reading next to
+    a rolling time-series plot of level history (scatter + line), plus a
+    "Last read:" footer and a manual refresh button. See DewarFillWidget for
+    the color-state convention (ok / stale / low).
+    """
+    refresh_clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet(f"QFrame{{background:{PBG};border:1px solid {LN2_C};border-radius:7px;}}")
+        root = QVBoxLayout(self); root.setContentsMargins(10, 8, 10, 8); root.setSpacing(5)
+
+        hdr = QHBoxLayout()
+        nm = QLabel("LN2 Dewar"); nm.setStyleSheet(f"color:{LN2_C};font-size:12px;font-weight:bold;")
+        self.lvl_lbl = QLabel("--- in"); self.lvl_lbl.setStyleSheet(f"color:{FG};font-size:12px;font-weight:bold;")
+        self.refresh_btn = QPushButton("⟳"); self.refresh_btn.setFixedSize(24, 22)
+        self.refresh_btn.setToolTip("Manually refresh the LN2 reading now")
+        self.refresh_btn.setStyleSheet(
+            f"QPushButton{{background:{BG};color:{FG};border:1px solid {BDR};border-radius:4px;font-weight:bold;}}"
+            f"QPushButton:hover{{background:#3a3a5e;}}QPushButton:disabled{{color:{DIM};}}")
+        self.refresh_btn.clicked.connect(self.refresh_clicked.emit)
+        hdr.addWidget(nm); hdr.addStretch(1); hdr.addWidget(self.lvl_lbl); hdr.addSpacing(6); hdr.addWidget(self.refresh_btn)
+        root.addLayout(hdr)
+
+        body = QHBoxLayout(); body.setSpacing(8)
+        self.fill = DewarFillWidget(); self.fill.setFixedWidth(30)
+        body.addWidget(self.fill)
+
+        if HAS_PG:
+            self.plot = pg.PlotWidget(axisItems={'bottom': pg.DateAxisItem()})
+            self.plot.setBackground(BG)
+            self.plot.showGrid(x=True, y=True, alpha=0.15)
+            self.plot.setMinimumHeight(90)
+            self.plot.getAxis('left').setLabel('in')
+            self.plot.getAxis('left').setWidth(32)
+            self.curve = self.plot.plot([], [], pen=pg.mkPen(LN2_C, width=1.6),
+                                         symbol='o', symbolSize=5,
+                                         symbolBrush=LN2_C, symbolPen=None)
+            body.addWidget(self.plot, 1)
+        else:
+            self.plot = None
+            body.addWidget(QLabel("pyqtgraph not installed"), 1)
+        root.addLayout(body)
+
+        self.status_lbl = QLabel("Last read: never")
+        self.status_lbl.setStyleSheet(f"color:{DIM};font-size:9px;")
+        root.addWidget(self.status_lbl)
+
+    def update_display(self, reading, last_read_str, state, full_scale_in, in_progress):
+        """reading: LN2Reading|None.  state: 'ok' | 'stale' | 'low'."""
+        level = reading.level_in if reading else None
+        self.lvl_lbl.setText(f"{level:.1f} in" if level is not None else "--- in")
+        self.lvl_lbl.setStyleSheet(f"color:{RD if state=='low' else FG};font-size:12px;font-weight:bold;")
+
+        frac = None if level is None else level / full_scale_in
+        self.fill.set_level(frac, state)
+
+        border_c = {"stale": YL, "low": RD}.get(state, LN2_C)
+        pen_w = 2 if state in ("stale", "low") else 1
+        self.setStyleSheet(f"QFrame{{background:{PBG};border:{pen_w}px solid {border_c};border-radius:7px;}}")
+
+        suffix = "  ⏳ checking…" if in_progress else ""
+        self.status_lbl.setText(f"Last read: {last_read_str}{suffix}")
+        self.status_lbl.setStyleSheet(f"color:{YL if state=='stale' else DIM};font-size:9px;")
+
+        self.refresh_btn.setEnabled(not in_progress)
+
+    def update_plot(self, t_list, level_list):
+        if self.plot is not None:
+            self.curve.setData(t_list, level_list)
+
+
 # ── Settings dialog ───────────────────────────────────────────────────
 class SettingsDlg(QDialog):
     def __init__(self, cfg, parent=None):
@@ -313,12 +473,12 @@ class SettingsDlg(QDialog):
         def _cb(cur):
             cb=QComboBox(); cb.setEditable(True); cb.addItems(ps)
             i=cb.findText(cur); cb.setCurrentIndex(i) if i>=0 else cb.setCurrentText(cur); return cb
-        self.bp=_cb(cfg.get("brax_port","COM11")); self.ba=QSpinBox(); self.ba.setRange(0,255); self.ba.setValue(cfg.get("brax_addr",1))
+        self.bp=_cb(cfg.get("brax_port","COM3")); self.ba=QSpinBox(); self.ba.setRange(0,255); self.ba.setValue(cfg.get("brax_addr",1))
         self.bb=QComboBox(); self.bb.addItems(["9600","19200","38400"]); self.bb.setCurrentText(str(cfg.get("brax_baud",19200)))
-        self.hp=_cb(cfg.get("heat3_port","COM12")); self.hi=QSpinBox(); self.hi.setRange(1,247); self.hi.setValue(cfg.get("heat3_id",1))
+        self.hp=_cb(cfg.get("heat3_port","COM6")); self.hi=QSpinBox(); self.hi.setRange(1,247); self.hi.setValue(cfg.get("heat3_id",1))
         self.hb=QComboBox(); self.hb.addItems(["9600","19200","57600","115200"]); self.hb.setCurrentText(str(cfg.get("heat3_baud",19200)))
-        self.ap=_cb(cfg.get("arduino_port","COM7"))
-        self.ep=_cb(cfg.get("epc3004_port","COM13")); self.ei=QSpinBox(); self.ei.setRange(1,247); self.ei.setValue(cfg.get("epc3004_id",1))
+        self.ap=_cb(cfg.get("arduino_port","COM5"))
+        self.ep=_cb(cfg.get("epc3004_port","COM7")); self.ei=QSpinBox(); self.ei.setRange(1,247); self.ei.setValue(cfg.get("epc3004_id",1))
         self.eb=QComboBox(); self.eb.addItems(["9600","19200","38400","57600"]); self.eb.setCurrentText(str(cfg.get("epc3004_baud",19200)))
         self.pi=QDoubleSpinBox(); self.pi.setRange(0.1,30); self.pi.setDecimals(2); self.pi.setSuffix(" s"); self.pi.setValue(cfg.get("poll_interval",0.25))
         self._cbs=[self.bp,self.hp,self.ap,self.ep]
@@ -573,12 +733,38 @@ class _RecipeBridge(QObject):
     state_change = pyqtSignal(str)
 
 
+# ── LN2 signal bridge ────────────────────────────────────────────────
+class _RHEEDWindow(QMainWindow):
+    """Pop-out host for the RHEED panel. Closing it only DOCKS the panel back into the
+    main window's tab (MainWindow._rheed_dock) — the camera keeps running."""
+    closed = pyqtSignal()
+
+    def closeEvent(self, e):
+        self.closed.emit(); e.accept()
+
+
+class _LogBridge(QObject):
+    """Log lines from plain threads → main thread (pyqtSignal, never QTimer.singleShot
+    from a thread — BUG 7/20). Used by the run-log export."""
+    msg = pyqtSignal(str)
+
+
+class _LN2Bridge(QObject):
+    """Thread-safe bridge from LN2Monitor's scheduler/fetch threads to the
+    GUI thread (same rationale as _RecipeBridge — pyqtSignal, not
+    QTimer.singleShot, for reliable delivery from a plain threading.Thread)."""
+    reading_updated = pyqtSignal(object, bool)   # (LN2Reading|None, ok)
+
+
 # ── Main window ───────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
-    DCFG={"brax_port":"COM11","brax_addr":1,"brax_baud":19200,
-          "heat3_port":"COM12","heat3_id":1,"heat3_baud":19200,
-          "arduino_port":"COM7","poll_interval":0.25,
-          "epc3004_port":"COM13","epc3004_id":1,"epc3004_baud":19200}
+    # Default COM ports = the lab PC's wiring (user, 2026-10-21); top bar left → right:
+    # BRAX COM3 · HEAT3 COM6 · Arduino shutter COM5 · EPC3004 COM7. Not persisted —
+    # these apply at every launch; change per session in the top bar or ⚙ Settings.
+    DCFG={"brax_port":"COM3","brax_addr":1,"brax_baud":19200,
+          "heat3_port":"COM6","heat3_id":1,"heat3_baud":19200,
+          "arduino_port":"COM5","poll_interval":0.25,
+          "epc3004_port":"COM7","epc3004_id":1,"epc3004_baud":19200}
 
     def __init__(self):
         super().__init__(); self.cfg=dict(self.DCFG)
@@ -615,6 +801,9 @@ class MainWindow(QMainWindow):
         self.rec_log=RecipeLogger()
         self._log_was_running=False
         self._active_recipe_row = -1   # tracks which row is visually highlighted
+        self._recipe_path = None       # file backing the recipe table, for Save vs Save As
+        self._run_t0  = None           # wall-clock start of the current recipe run
+        self._run_est = 0.0            # loop-aware estimated run length (s), for progress/ETA
         self._sync_p_idx = 0           # last rec_log pressure row synced to plot buffers
         self._sync_t_idx = 0           # last rec_log temp row synced to plot buffers
         self.snap=Snap(); self.poller=Poller(self.snap, interval=self.cfg.get("poll_interval", 0.25))
@@ -622,8 +811,18 @@ class MainWindow(QMainWindow):
         if self._plot_worker: self._plot_worker.window_s = self._WIN_DEFAULT
         self.bep=BEPManager(); self.bep.load_history_from_csv()
         self._bep_ok=False
+        self.ln2=LN2Monitor(history_path=log_paths.system_file("ln2_history.csv", legacy=_LN2_OLD))
+        self._logb=_LogBridge()
         self._build(); self._wire()
+        self._logb.msg.connect(self._log)
+        self.recipe.rheed_capture=self._rheed_recipe_capture   # RHEED_VIDEO action
+        self._rheed_n=0
         self.poller.start(); self._timers()
+        self._log(f"📁 {log_paths.describe()}  (system: {log_paths.SYSTEM_DIR} · "
+                  f"deposition: {log_paths.DEPOSITION_DIR})")
+        # DataLogger's writer thread reports problems (Box stall, fallback) here
+        self._notes_t=QTimer(self); self._notes_t.timeout.connect(self._logger_notes); self._notes_t.start(2000)
+        self.ln2.start_scheduler()
 
     def _resolve(self):
         def _p(r,s): return r if (r and r.connected) else (s if self._test else None)
@@ -635,6 +834,7 @@ class MainWindow(QMainWindow):
             obj.indium=self.indium
         self.poller.logger = self.logger   # Poller feeds DataLogger on every cycle
         self.recipe.shutter=self.shutter; self.bep.shutter=self.shutter; self.rec_log.shutter=self.shutter
+        self.recipe.bep = self.bep      # MEASURE_BEP action runs through the same manager
         # hook debug callback
         if self._h3:
             self._h3.debug_callback = (lambda m: QTimer.singleShot(0,lambda:self._log(f"<span style='color:#888'>DBG {m}</span>"))) if self._debug else None
@@ -654,6 +854,7 @@ class MainWindow(QMainWindow):
         fm.addAction("Export Firmware…",self._export_fw); fm.addSeparator(); fm.addAction("Quit",self.close)
         hm=mb.addMenu("Hardware"); hm.addAction("Connect All",self._conn_all); hm.addAction("Disconnect All",self._disc_all)
         hm.addSeparator(); hm.addAction("Connect BRAX",self._conn_brax); hm.addAction("Connect HEAT3",self._conn_h3); hm.addAction("Connect Arduino",self._conn_ard); hm.addAction("Connect EPC3004",self._conn_epc)
+        wm=mb.addMenu("Window"); wm.addAction("📡 RHEED in its own window / dock back",self._rheed_toggle_popout)
         c=QWidget(); self.setCentralWidget(c)
         root=QVBoxLayout(c); root.setContentsMargins(8,4,8,4); root.setSpacing(6)
         root.addWidget(self._topbar())
@@ -675,8 +876,12 @@ class MainWindow(QMainWindow):
         self.db=QPushButton("🐛 Debug: OFF"); self.db.setCheckable(True); self.db.setFixedWidth(120); self.db.clicked.connect(self._toggle_debug)
         self.db.setStyleSheet(f"QPushButton{{background:{PBG};color:{DIM};border:1px solid {BDR};border-radius:4px;font-size:10px;}}"); 
         ps=list_ports() or ["COM1","COM2","COM3","COM4","COM5"]; self._cbs={}
+        pdesc=port_descriptions()
+        _names={"brax_port":"BRAX","heat3_port":"HEAT3","arduino_port":"Arduino shutter","epc3004_port":"EPC3004"}
         for k in ["brax_port","heat3_port","arduino_port","epc3004_port"]:
             cb=QComboBox(); cb.setEditable(True); cb.setFixedWidth(78); cb.addItems(ps)
+            for j,pn in enumerate(ps): cb.setItemData(j, pdesc.get(pn, pn), Qt.ToolTipRole)
+            cb.setToolTip(f"{_names[k]} port — hover the list entries for what each COM is")
             i=cb.findText(self.cfg.get(k,"")); cb.setCurrentIndex(i) if i>=0 else cb.setCurrentText(self.cfg.get(k,""))
             cb.currentTextChanged.connect(lambda t,k2=k: self.cfg.__setitem__(k2,t)); self._cbs[k]=cb
         ca=QPushButton("Connect All"); ca.setFixedWidth(92); ca.clicked.connect(self._conn_all)
@@ -729,7 +934,7 @@ class MainWindow(QMainWindow):
 
     def _left(self):
         w=QWidget(); w.setMinimumWidth(445); v=QVBoxLayout(w); v.setContentsMargins(0,0,0,0); v.setSpacing(8)
-        v.addWidget(self._pres_grp()); v.addWidget(self._heat3_grp()); v.addWidget(self._indium_grp()); v.addWidget(self._shutter_grp()); v.addStretch(1)
+        v.addWidget(self._pres_grp()); v.addWidget(self._heat3_grp()); v.addWidget(self._indium_grp()); v.addWidget(self._shutter_grp()); v.addWidget(self._ln2_grp()); v.addStretch(1)
         return w
 
     def _pres_grp(self):
@@ -790,11 +995,56 @@ class MainWindow(QMainWindow):
         gl.addWidget(self.bo_b,2,0,1,2); gl.addWidget(self.bc_b,2,2,1,2)
         return g
 
+    def _ln2_grp(self):
+        g = QGroupBox("LN2 Supply"); g.setStyleSheet(self._gs()); v = QVBoxLayout(g)
+        self.ln2_panel = LN2Panel()
+        self.ln2_panel.refresh_clicked.connect(self._ln2_refresh)
+        v.addWidget(self.ln2_panel)
+        self._refresh_ln2_display()   # paint whatever history was loaded on startup
+        return g
+
+    def _ln2_refresh(self):
+        """Manual refresh button — fire-and-forget daemon thread (never block the GUI
+        on network I/O). LN2Monitor.fetch() is internally re-entrancy-guarded, so a
+        double-click just no-ops the second call."""
+        if self.ln2.in_progress:
+            return
+        self._refresh_ln2_display()   # immediately show the "checking…" state
+        threading.Thread(target=self.ln2.fetch, daemon=True).start()
+
+    def _on_ln2_reading(self, reading, ok):
+        """Runs on the main thread via _LN2Bridge (BUG 7/20 pattern)."""
+        if ok and reading is not None:
+            self._log(f"❄ LN2 reading: {reading.level_in:.1f} in")
+        else:
+            self._log(f"⚠ LN2 read failed: {self.ln2.last_error or 'unknown error'}")
+        self._refresh_ln2_display()
+
+    def _refresh_ln2_display(self):
+        """Repaints the LN2 panel from LN2Monitor's current state. Called after every
+        fetch attempt and on a periodic timer so the stale/yellow state advances even
+        without a new reading. 'low' (level ≤ LOW_LEVEL_IN) takes priority over 'stale'
+        when both are true — a critically low last-known level is the more urgent signal."""
+        reading = self.ln2.last_reading
+        if reading is not None and reading.level_in <= LOW_LEVEL_IN:
+            state = "low"
+        elif self.ln2.is_stale(STALE_HOURS):
+            state = "stale"
+        else:
+            state = "ok"
+        self.ln2_panel.update_display(reading, self.ln2.last_read_str(), state,
+                                       self.ln2.full_scale_for(reading), self.ln2.in_progress)
+        if HAS_PG:
+            t, lv = self.ln2.history(hours=24 * 7)   # last 7 days
+            self.ln2_panel.update_plot(t, lv)
+
     def _right(self):
         w=QWidget(); v=QVBoxLayout(w); v.setContentsMargins(0,0,0,0); v.setSpacing(6)
         ts=f"QTabWidget::pane{{border:1px solid {BDR};background:{PBG};}} QTabBar::tab{{background:{BG};color:{DIM};padding:6px 14px;border:1px solid {BDR};border-bottom:none;border-radius:4px 4px 0 0;}} QTabBar::tab:selected{{background:{PBG};color:{FG};}}"
         tabs=QTabWidget(); tabs.setStyleSheet(ts)
         tabs.addTab(self._plot_tab(),"📈 Live Plot"); tabs.addTab(self._recipe_tab(),"📋 Recipe"); tabs.addTab(self._bep_tab(),"🔬 BEP"); tabs.addTab(self._safety_tab(),"⚠ Safety")
+        tabs.addTab(self._rheed_tab_page(),"📡 RHEED")
+        self._tabs=tabs
         v.addWidget(tabs)
         lg=QGroupBox("System Log"); lg.setStyleSheet(self._gs()); lg.setMaximumHeight(148); lv=QVBoxLayout(lg)
         self.log_w=QTextEdit(); self.log_w.setReadOnly(True)
@@ -911,9 +1161,12 @@ class MainWindow(QMainWindow):
     def _recipe_tab(self):
         w=QWidget(); v=QVBoxLayout(w); v.setContentsMargins(4,4,4,4); v.setSpacing(5)
         tb=QHBoxLayout()
-        self.rl=QPushButton("📂 Load"); self.rs=QPushButton("💾 Save"); self.ra=QPushButton("+ Row"); self.rd=QPushButton("✕ Del")
-        for b in [self.rl,self.rs,self.ra,self.rd]: b.setStyleSheet(f"QPushButton{{background:{PBG};color:{FG};border:1px solid {BDR};border-radius:4px;padding:3px 8px;}}QPushButton:hover{{background:#3a3a5e;}}")
+        self.rn=QPushButton("🆕 New"); self.rl=QPushButton("📂 Load"); self.rs=QPushButton("💾 Save")
+        self.rsa=QPushButton("💾 Save As…"); self.ra=QPushButton("+ Row"); self.rd=QPushButton("✕ Del")
+        for b in [self.rn,self.rl,self.rs,self.rsa,self.ra,self.rd]: b.setStyleSheet(f"QPushButton{{background:{PBG};color:{FG};border:1px solid {BDR};border-radius:4px;padding:3px 8px;}}QPushButton:hover{{background:#3a3a5e;}}")
+        self.rn.clicked.connect(self._new_recipe)
         self.rl.clicked.connect(self._load_recipe); self.rs.clicked.connect(self._save_recipe)
+        self.rsa.clicked.connect(self._save_recipe_as)
         self.ra.clicked.connect(lambda: self._rtab_add()); self.rd.clicked.connect(self._rtab_del)
         self.rf=QLabel("No file"); self.rf.setStyleSheet(f"color:{DIM};font-size:10px;")
         self.rrun=QPushButton("▶ Run"); self.rpau=QPushButton("⏸"); self.rsto=QPushButton("⏹")
@@ -921,9 +1174,32 @@ class MainWindow(QMainWindow):
         self.rrun.clicked.connect(self._r_run); self.rpau.clicked.connect(self.recipe.pause); self.rsto.clicked.connect(self._r_stop)
         sl=QHBoxLayout(); self.rst=QLabel("IDLE"); self.rst.setStyleSheet(f"color:{BL};font-weight:bold;"); self.rsk=QLabel("—"); self.rsk.setStyleSheet(f"color:{FG};font-weight:bold;")
         sl.addWidget(QLabel("State:")); sl.addWidget(self.rst); sl.addStretch(1); sl.addWidget(QLabel("Step:")); sl.addWidget(self.rsk)
-        tb.addWidget(self.rl); tb.addWidget(self.rs); tb.addWidget(self.rf); tb.addStretch(1)
+        tb.addWidget(self.rn); tb.addWidget(self.rl); tb.addWidget(self.rs); tb.addWidget(self.rsa)
+        tb.addWidget(self.rf); tb.addStretch(1)
         tb.addWidget(self.ra); tb.addWidget(self.rd); tb.addSpacing(8); tb.addWidget(self.rrun); tb.addWidget(self.rpau); tb.addWidget(self.rsto)
         v.addLayout(tb); v.addLayout(sl)
+
+        # ── Run progress: % complete, loop counter, time left, ETA ────
+        pf=QFrame(); pf.setStyleSheet(f"QFrame{{background:{PBG};border:1px solid {BDR};border-radius:4px;}}")
+        pfl=QVBoxLayout(pf); pfl.setContentsMargins(8,4,8,4); pfl.setSpacing(3)
+        prow=QHBoxLayout(); prow.setSpacing(8)
+        self.rprog=QProgressBar(); self.rprog.setRange(0,100); self.rprog.setValue(0)
+        self.rprog.setFixedHeight(16); self.rprog.setTextVisible(True); self.rprog.setFormat("%p%")
+        self.rprog.setStyleSheet(
+            f"QProgressBar{{background:{BG};border:1px solid {BDR};border-radius:3px;"
+            f"color:{FG};font-size:10px;text-align:center;}}"
+            f"QProgressBar::chunk{{background:{BL};border-radius:3px;}}")
+        lpl=QLabel("Loop:"); lpl.setStyleSheet(f"color:{DIM};font-size:10px;border:none;")
+        self.rloop=QLabel("—"); self.rloop.setMinimumWidth(56)
+        self.rloop.setStyleSheet(f"color:{OR};font-size:11px;font-weight:bold;border:none;")
+        self.rloop.setToolTip("Which pass of the active GOTO loop is running (pass / total passes)")
+        prow.addWidget(self.rprog,1); prow.addWidget(lpl); prow.addWidget(self.rloop)
+        trow=QHBoxLayout()
+        self.rleft=QLabel("Time left: —"); self.rleft.setStyleSheet(f"color:{FG};font-size:10px;border:none;")
+        self.reta =QLabel("Est. done: —"); self.reta.setStyleSheet(f"color:{DIM};font-size:10px;border:none;")
+        trow.addWidget(self.rleft); trow.addStretch(1); trow.addWidget(self.reta)
+        pfl.addLayout(prow); pfl.addLayout(trow)
+        v.addWidget(pf)
 
         # ── Collapsible column guide ──────────────────────────────────
         self._help_visible = False
@@ -948,15 +1224,20 @@ class MainWindow(QMainWindow):
             "<td style='padding:0 0 4px 0'>Examples / notes</td></tr>"
             "<tr><td><b>Step</b></td><td>Row number (auto-renumbered on reorder)</td><td>1, 2, 3 …</td></tr>"
             "<tr style='background:#1e1e2e;'><td><b>Action</b></td><td>Command to execute</td>"
-            "<td>SET_TEMP, WAIT_TEMP, RAMP_TEMP, OPEN_SHUTTER, CLOSE_SHUTTER,<br>"
-            "HEATER_ON/OFF, IG_ON/OFF, WAIT_TIME, WAIT_PRESSURE, GOTO, END</td></tr>"
+            "<td>SET_TEMP, INCREASE_TEMP, WAIT_TEMP, RAMP_TEMP, OPEN_SHUTTER, CLOSE_SHUTTER,<br>"
+            "HEATER_ON/OFF, IG_ON/OFF, WAIT_TIME, WAIT_PRESSURE, MEASURE_BEP, RHEED_VIDEO, GOTO, END</td></tr>"
             "<tr><td><b>Param 1</b></td><td>Primary argument (source / channel / value)</td>"
             "<td>SET_TEMP → <i>Se</i> or <i>Sub</i>&nbsp;&nbsp;OPEN_SHUTTER → <i>In / Se / Both</i><br>"
-            "WAIT_TIME → seconds&nbsp;&nbsp;GOTO → target step number</td></tr>"
+            "WAIT_TIME → seconds&nbsp;&nbsp;GOTO → target step number<br>"
+            "<b>RHEED_VIDEO → clip seconds</b> (0 = still image) — uses the 📡 RHEED tab's camera; "
+            "files &lt;sample&gt;_Sub&lt;T&gt;C_SeIn&lt;ratio&gt;_rheed_001… + .txt conditions, "
+            "in rheed/&lt;run&gt;/</td></tr>"
             "<tr style='background:#1e1e2e;'><td><b>Param 2</b></td><td>Secondary value (temperature / rate / loop count)</td>"
             "<td>SET_TEMP → setpoint °C&nbsp;&nbsp;WAIT_TEMP → tolerance °C (default ±2.5)<br>"
             "WAIT_PRESSURE → Torr threshold&nbsp;&nbsp;GOTO → extra loops&nbsp;&nbsp;"
-            "<b>RAMP_TEMP → °C/min</b> (sets device internal ramp rate)</td></tr>"
+            "<b>RAMP_TEMP → °C/min</b> (sets device internal ramp rate)<br>"
+            "<b>INCREASE_TEMP → Δ°C</b> (setpoint step, negative steps down)&nbsp;&nbsp;"
+            "MEASURE_BEP → Param1 = In / Se / Both</td></tr>"
             "<tr style='background:#1e1e2e;'><td><b>Notes</b></td><td>Free text — logged during execution</td><td></td></tr>"
             "</table>"
         )
@@ -1134,14 +1415,46 @@ class MainWindow(QMainWindow):
             out.append(types.SimpleNamespace(step=r+1,action=act,param1=p1,param2=p2,param3=None,notes=_g(4)))
         return out
 
-    def _save_recipe(self):
-        try: import openpyxl
-        except ImportError: QMessageBox.critical(self,"Error","pip install openpyxl"); return
-        path,_=QFileDialog.getSaveFileName(self,"Save Recipe","recipe.xlsx","Excel Files (*.xlsx)")
-        if not path: return
+    def _do_save_recipe(self, path):
+        import openpyxl
         wb=openpyxl.Workbook(); ws=wb.active; ws.title="Recipe"; ws.append(["Step","Action","Param1","Param2","Notes"])
         for s in self._rtab_to_steps(): ws.append([s.step,s.action,s.param1,s.param2,s.notes])
-        wb.save(path); self.rf.setText(os.path.basename(path)); self._log(f"Recipe saved → {path}")
+        wb.save(path)
+        self._recipe_path=path; self.rf.setText(os.path.basename(path))
+        self._log(f"Recipe saved → {path}")
+
+    def _save_recipe(self):
+        """Save over the loaded/last-saved file; falls back to Save As if there is none."""
+        if not self._recipe_path: return self._save_recipe_as()
+        try: self._do_save_recipe(self._recipe_path)
+        except Exception as e: QMessageBox.critical(self,"Save Error",str(e))
+
+    def _save_recipe_as(self):
+        try: import openpyxl  # noqa: F401
+        except ImportError: QMessageBox.critical(self,"Error","pip install openpyxl"); return
+        path,_=QFileDialog.getSaveFileName(self,"Save Recipe As",
+                                           self._recipe_path or "recipe.xlsx","Excel Files (*.xlsx)")
+        if not path: return
+        if not path.lower().endswith(".xlsx"): path+=".xlsx"
+        try: self._do_save_recipe(path)
+        except Exception as e: QMessageBox.critical(self,"Save Error",str(e))
+
+    def _new_recipe(self):
+        """Clear the table for a fresh recipe. Blocked mid-run, since the engine is
+        executing the steps this table describes and the active-row highlight
+        tracks it by index."""
+        if self.recipe.state in (RecipeEngine.STATE_RUNNING, RecipeEngine.STATE_PAUSED):
+            QMessageBox.warning(self,"Recipe running","Stop the run before starting a new recipe.")
+            return
+        if self.rtab.rowCount() and QMessageBox.question(
+                self,"New Recipe","Clear the current recipe table?\nUnsaved edits will be lost.",
+                QMessageBox.Yes|QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self.rtab.setRowCount(0); self._rtab_add()
+        self._recipe_path=None; self.rf.setText("No file")
+        self._active_recipe_row=-1
+        self._rp_timer.start()
+        self._log("New recipe")
 
     # ── Wire callbacks ────────────────────────────────────────────────
     def _wire(self):
@@ -1157,9 +1470,15 @@ class MainWindow(QMainWindow):
         self._rb.status_msg.connect(self._log)
         self._rb.state_change.connect(self._r_state)
         self.recipe.on_status_msg   = lambda m: self._rb.status_msg.emit(m)
+        # In-recipe MEASURE_BEP results → their own sheets in the run's .xlsx
+        self.recipe.on_bep_result   = lambda results: self.rec_log.add_bep_measurement(results)
         self.recipe.on_step_change  = lambda i: self._rb.step_change.emit(i)
         self.recipe.on_state_change = lambda s: self._rb.state_change.emit(s)
         self.logger.on_data=lambda p,t: None
+        # LN2: bridge from LN2Monitor's background scheduler/fetch threads
+        self._lb = _LN2Bridge()
+        self._lb.reading_updated.connect(self._on_ln2_reading)
+        self.ln2.on_reading = lambda r, ok: self._lb.reading_updated.emit(r, ok)
         if self._plot_worker:
             self._plot_worker.data_ready.connect(self._on_plot_data)
             self._plot_worker.start()
@@ -1170,6 +1489,11 @@ class MainWindow(QMainWindow):
         if HAS_PG:
             # Syncs rec_log rows into DataLogger buffers (fast, main thread only)
             self._pt=QTimer(); self._pt.setInterval(100); self._pt.timeout.connect(self._sync_rec_log); self._pt.start()
+        # LN2: no new reading needed to advance the stale/yellow state — just re-evaluate
+        # "hours since last read" against STALE_HOURS periodically (no I/O, main thread only)
+        self._lt=QTimer(); self._lt.setInterval(60_000); self._lt.timeout.connect(self._refresh_ln2_display); self._lt.start()
+        # Recipe run progress / ETA — 1 Hz is plenty for a seconds-resolution readout
+        self._rt=QTimer(); self._rt.setInterval(1000); self._rt.timeout.connect(self._update_run_progress); self._rt.start()
 
     def _vals(self):
         bo=self._br is not None and self._br.connected; ho=self._h3 is not None and self._h3.connected; ao=self._sh is not None and self._sh.connected
@@ -1246,6 +1570,183 @@ class MainWindow(QMainWindow):
             self.tp.setXRange(x_min, x_max, padding=0)
 
     # ── Log ───────────────────────────────────────────────────────────
+    # ── RHEED (rheed/ package, CONTEXT Section 20) ────────────────────
+    # Hosted IN THIS PROCESS — running rheed_app.py next to the controller as a second
+    # program coincided with COM trouble (user, 2026-10-21). One process = one owner of
+    # the serial ports. The panel can live in the "📡 RHEED" tab or be popped out into
+    # its own window (second monitor) and docked back; closing that window docks it.
+    def _rheed_tab_page(self):
+        page=QWidget(); pv=QVBoxLayout(page); pv.setContentsMargins(4,4,4,4); pv.setSpacing(4)
+        self.rheed_tab=None; self._rheed_win=None; self._rheed_err=""
+        bar=QHBoxLayout()
+        self._rheed_lbl=QLabel("RHEED camera · live view, rotation sync, intensity tracking, video analysis")
+        self._rheed_lbl.setStyleSheet(f"color:{DIM};")
+        self._rheed_pop=QPushButton("⧉ Pop out"); self._rheed_pop.setFixedWidth(110)
+        self._rheed_pop.setToolTip("Move the RHEED panel into its own window (same program — the\n"
+                                   "COM connections are not touched). Close that window to dock it back.")
+        self._rheed_pop.clicked.connect(self._rheed_toggle_popout)
+        bar.addWidget(self._rheed_lbl,1); bar.addWidget(self._rheed_pop); pv.addLayout(bar)
+        self._rheed_slot=QVBoxLayout(); pv.addLayout(self._rheed_slot,1)
+        try:
+            from rheed.rheed_tab import RHEEDTab
+            self.rheed_tab=RHEEDTab(log_fn=self._rheed_log, out_root=log_paths.RHEED_DIR,
+                                    video_root=os.path.join(log_paths.LOCAL_ROOT,"rheed","videos"))
+            self._rheed_slot.addWidget(self.rheed_tab,1)
+        except Exception as e:                 # e.g. OpenCV missing — the controller must still run
+            self._rheed_err=f"RHEED panel unavailable: {e}"
+            lab=QLabel(self._rheed_err+"\n(pip install \"opencv-python-headless<4.11\" — see CONTEXT Section 1)")
+            lab.setStyleSheet(f"color:{OR};"); self._rheed_slot.addWidget(lab)
+            self._rheed_pop.setEnabled(False)
+        return page
+
+    # ── recipe action RHEED_VIDEO (runs on the RECIPE thread — no Qt calls here) ──
+    def _rheed_recipe_capture(self, duration, step_no, should_stop):
+        """Record a clip (or a still) with the 📡 RHEED tab's camera + a same-name .txt
+        of the MBE conditions over the clip. Files:
+            <RHEED_DIR>/<run name>/<sample>_Sub<T>C_SeIn<ratio>_rheed_<NNN>.avi|.png + .txt
+        <run name> = the run .xlsx name; <sample> = the name given to the RUN (not the
+        RHEED tab's Sample box); NNN counts up every execution (GOTO loops). Recorded on
+        the LOCAL disk, then moved to Box in the background (a 12 MB/s stream written
+        straight onto Box Drive could stall → dropped frames)."""
+        from rheed.capture import record_clip
+        lp=self.rheed_tab.live if self.rheed_tab is not None else None
+        src=lp.source if lp is not None else None
+        if src is None or not src.connected:
+            return {"ok":False,"msg":"RHEED_VIDEO: no camera connected on the 📡 RHEED tab — step skipped"}
+        self._rheed_n+=1; n=self._rheed_n
+        run=self.rec_log.run_name if self.rec_log.running else f"{time.strftime('%Y%m%d_%H%M%S')}_manual"
+        sub=self._last_val(self.logger.get_ch2_temp_history())
+        ratio=self.bep.se_in_ratio
+        name=(f"{self.rec_log.safe_sample}_Sub{'NA' if sub is None else f'{sub:.0f}'}C_"
+              f"SeIn{'NA' if not ratio else f'{ratio:.2f}'}_rheed_{n:03d}")
+        local_dir=os.path.join(log_paths.LOCAL_ROOT,"rheed",run)
+        box_dir=os.path.join(log_paths.RHEED_DIR,run)
+        cond0=self._rheed_conditions()          # setpoints / shutters at the start
+        t_req=time.time()
+        r=record_clip(src, os.path.join(local_dir,name+".avi"), float(duration), should_stop)
+        if not r["ok"]:
+            return {"ok":False,"msg":f"RHEED_VIDEO clip {n}: {r['msg']}"}
+        meta=os.path.splitext(r["path"])[0]+".txt"
+        try:
+            self._rheed_write_meta(meta, r, n, step_no, run, sub, ratio, cond0, t_req, src)
+        except Exception as e:
+            meta=""; self._logb.msg.emit(f"<span style='color:{OR}'>⚠ RHEED metadata not written: {e}</span>")
+        files=[f for f in (r["path"],meta) if f]
+        final=[os.path.join(box_dir,os.path.basename(f)) for f in files] if box_dir!=local_dir else files
+        self.rec_log.add_rheed_clip({"n":n,"step":step_no,"start":datetime.fromtimestamp(r["t_first"] or t_req).isoformat(timespec="seconds"),
+                                     "duration_s":round((r["t_last"] or t_req)-(r["t_first"] or t_req),2),"frames":r["frames"],
+                                     "sub_temp_c":None if sub is None else round(sub,1),"se_in_ratio":ratio,
+                                     "file":os.path.basename(final[0]),"meta":os.path.basename(final[1]) if len(final)>1 else "",
+                                     "folder":os.path.dirname(final[0])})
+        if box_dir!=local_dir:
+            threading.Thread(target=self._rheed_move, args=(files,box_dir), name="RHEED-move", daemon=True).start()
+        what="still" if r["codec"]=="PNG" else f"{r['frames']} frames ({r['fps']:.1f} fps, {r['dropped']} dropped)"
+        return {"ok":True,"msg":f"📡 RHEED clip {n}: {os.path.basename(r['path'])} — {what}"}
+
+    @staticmethod
+    def _last_val(hist):
+        _, v=hist
+        return next((x for x in reversed(v) if x is not None), None)
+
+    def _rheed_conditions(self):
+        """Setpoints + shutter states right now (recipe thread — serial reads are OK
+        here, the recipe already talks to the devices from this thread)."""
+        c={}
+        def rd(fn):
+            try: return fn()
+            except Exception: return None
+        if self.heat3 is not None:
+            c["Se (CH1) setpoint C"]=rd(self.heat3.ch1_read_setpoint)
+            c["Sub (CH2) setpoint C"]=rd(self.heat3.ch2_read_setpoint)
+        if self.indium is not None:
+            c["In (EPC3004) setpoint C"]=rd(self.indium.ch1_read_setpoint)
+        sh=self.shutter
+        if sh is not None:
+            c["In shutter"]="OPEN" if getattr(sh,"in_is_open",False) else "closed"
+            c["Se shutter"]="OPEN" if getattr(sh,"se_is_open",False) else "closed"
+        return c
+
+    def _rheed_write_meta(self, path, r, n, step_no, run, sub, ratio, cond0, t_req, src):
+        t0=r["t_first"] or t_req; t1=r["t_last"] or t0
+        tp,pv=self.logger.get_pressure_history(); _,c1=self.logger.get_temp_history()
+        _,c2=self.logger.get_ch2_temp_history(); _,ci=self.logger.get_in_temp_history()
+        rows=[(t,a,b,c,d) for t,a,b,c,d in zip(tp,pv,c1,c2,ci) if t0-0.5<=t<=t1+0.5]
+        cond1=self._rheed_conditions()
+        cam=(f"camera index {src.index}" if hasattr(src,"index") else type(src).__name__)
+        def f(v,fmt): return "N/A" if v is None else format(v,fmt)
+        L=[f"# RHEED clip metadata — Vacuum Deposition Control",
+           f"sample: {self.rec_log.sample_name}", f"run: {run}", f"recipe step: {step_no}",
+           f"clip number in run: {n}", f"file: {os.path.basename(r['path'])}",
+           f"start: {datetime.fromtimestamp(t0).isoformat(timespec='milliseconds')}",
+           f"end:   {datetime.fromtimestamp(t1).isoformat(timespec='milliseconds')}",
+           f"length_s: {t1-t0:.2f}",
+           f"camera: {cam}, {r['resolution'][0]}x{r['resolution'][1]}, {r['codec']}, "
+           f"{r['frames']} frames, {r['fps']:.2f} fps measured, {r['dropped']} dropped",
+           f"substrate_T_at_start_C: {f(sub,'.1f')}",
+           f"Se/In BEP ratio (last BEP measurement): {f(ratio,'.4f')}",
+           f"In BEP Torr: {f(self.bep.last_in_bep,'.3e')}   Se BEP Torr: {f(self.bep.last_se_bep,'.3e')}",
+           "conditions at start: " + ", ".join(f"{k} = {v}" for k,v in cond0.items()),
+           "conditions at end:   " + ", ".join(f"{k} = {v}" for k,v in cond1.items()),
+           "", "# summary over the clip  (column: min / mean / max, n readings)"]
+        for j,lab in enumerate(("IG_Pressure_Torr","CH1_Se_C","CH2_Sub_C","In_C"),start=1):
+            vals=[x[j] for x in rows if x[j] is not None]
+            if vals:
+                fm=".3e" if j==1 else ".2f"
+                L.append(f"{lab}: {min(vals):{fm}} / {sum(vals)/len(vals):{fm}} / {max(vals):{fm}}, n={len(vals)}")
+            else:
+                L.append(f"{lab}: no readings")
+        L+=["", "# time series (hardware poller, ~4 Hz)",
+            "Timestamp,Elapsed_s,IG_Pressure_Torr,CH1_Se_C,CH2_Sub_C,In_C"]
+        for t,a,b,c,d in rows:
+            L.append(f"{datetime.fromtimestamp(t).isoformat(timespec='milliseconds')},{t-t0:.2f},"
+                     f"{f(a,'.4e')},{f(b,'.2f')},{f(c,'.2f')},{f(d,'.2f')}")
+        with open(path,"w",encoding="utf-8") as fh:
+            fh.write("\n".join(L)+"\n")
+
+    def _rheed_move(self, files, dest):
+        """Background: local clip + metadata → the Box run folder (copy, verify size,
+        delete local). On failure the files stay local and the log says where."""
+        import shutil
+        try:
+            os.makedirs(dest, exist_ok=True)
+            for f in files:
+                tgt=os.path.join(dest,os.path.basename(f))
+                shutil.copy2(f,tgt)
+                if os.path.getsize(tgt)==os.path.getsize(f):
+                    os.remove(f)
+        except Exception as e:
+            self._logb.msg.emit(f"<span style='color:{OR}'>⚠ RHEED clip kept locally "
+                                f"({os.path.dirname(files[0])}) — could not move to Box: {e}</span>")
+
+    def _rheed_log(self, msg):
+        if hasattr(self,"log_w"):              # RHEED lines into the System Log, marked
+            self._log(f"<span style='color:{IN_C}'>📡</span> {msg}")
+
+    def _rheed_toggle_popout(self):
+        if self.rheed_tab is None:
+            return
+        if self._rheed_win is None:
+            w=_RHEEDWindow(self); w.setWindowTitle("📡 RHEED — Vacuum Deposition Control")
+            w.closed.connect(self._rheed_dock)
+            self._rheed_slot.removeWidget(self.rheed_tab)
+            w.setCentralWidget(self.rheed_tab)  # reparents — the widget and its camera live on
+            scr=self.screen().availableGeometry() if hasattr(self,"screen") else None
+            w.resize(max(1000,int(scr.width()*0.8)) if scr else 1400, max(650,int(scr.height()*0.8)) if scr else 900)
+            self._rheed_win=w; w.show()
+            self._rheed_pop.setText("⧈ Dock back"); self._rheed_lbl.setText("RHEED panel is in its own window")
+        else:
+            self._rheed_win.close()           # → closed → _rheed_dock
+
+    def _rheed_dock(self):
+        w=self._rheed_win
+        if w is None or self.rheed_tab is None:
+            return
+        self._rheed_win=None
+        tab=w.takeCentralWidget()             # keep it alive; QMainWindow would delete it
+        self._rheed_slot.addWidget(tab,1); tab.show()
+        self._rheed_pop.setText("⧉ Pop out"); self._rheed_lbl.setText("RHEED camera · live view, rotation sync, intensity tracking, video analysis")
+        w.deleteLater()
+
     def _log(self, msg):
         ts=time.strftime("%H:%M:%S")
         self.log_w.append(f"<span style='color:{DIM}'>[{ts}]</span> {msg}")
@@ -1762,21 +2263,31 @@ class MainWindow(QMainWindow):
     def _simulate_recipe_timeline(steps):
         """Walk recipe steps and build a proportional timeline for the preview plot.
 
+        GOTO loops are multiplied out in TIME but drawn as a single cycle: the
+        body is traced once at true size, then the clock jumps forward by the
+        remaining passes so the total estimate (and the run progress bar that
+        reads pts_t[-1]) is loop-aware. The dashed loop region spans the whole
+        multiplied span, which keeps a 50-pass recipe readable.
+
         Returns:
           pts_t, pts_se, pts_sub  : temperature trace arrays
           shutter_segs            : List[(t0,t1,in_open,se_open)]
           rate_markers            : List[(t, rate_°C/min, ch)]  — RAMP_TEMP events
           goto_regions            : List[(t0, t1, label_str)]
           unk_regions             : List[(t0, t1)]  — WAIT_TEMP / WAIT_PRESSURE
+          bep_regions             : List[(t0, t1, source)]  — MEASURE_BEP windows
         """
         t = 0.0
         se_t, sub_t = 25.0, 25.0
         se_rate, sub_rate = 4.0, 100.0   # °C/min defaults (HEAT3 factory)
+        # Indium is tracked for TIMING only — the preview plots Se and Sub, but an
+        # Indium calibration run still has to advance the clock correctly.
+        in_t, in_rate = 25.0, 100.0      # EPC3004 factory SP rate
         cur_in = cur_se = False
 
         pts_t=[0.0]; pts_se=[se_t]; pts_sub=[sub_t]
         shutter_segs=[]; cur_sh_t=0.0
-        rate_markers=[]; goto_regions=[]; unk_regions=[]
+        rate_markers=[]; goto_regions=[]; unk_regions=[]; bep_regions=[]
         step_times={}   # step number → t at entry
         UNKNOWN_DT=120.0
 
@@ -1790,38 +2301,93 @@ class MainWindow(QMainWindow):
             if t > cur_sh_t:
                 shutter_segs.append((cur_sh_t, t, cur_in, cur_se))
 
+        def stretch(from_t, factor):
+            """Scale everything drawn at/after from_t by `factor`, about from_t.
+
+            Used by GOTO so the single drawn cycle is widened in proportion to
+            fill the whole looped duration, instead of a cycle plus dead space.
+            """
+            nonlocal cur_sh_t
+            def sc(v): return from_t + (v - from_t)*factor if v >= from_t else v
+            for i, v in enumerate(pts_t):
+                if v >= from_t: pts_t[i] = sc(v)
+            for i, (a0, b0, x, y) in enumerate(shutter_segs):
+                if b0 >= from_t: shutter_segs[i] = (sc(a0), sc(b0), x, y)
+            for i, (a0, b0) in enumerate(unk_regions):
+                if b0 >= from_t: unk_regions[i] = (sc(a0), sc(b0))
+            for i, (tm, r, c) in enumerate(rate_markers):
+                if tm >= from_t: rate_markers[i] = (sc(tm), r, c)
+            for i, (a0, b0, lb) in enumerate(goto_regions):
+                if b0 >= from_t: goto_regions[i] = (sc(a0), sc(b0), lb)
+            for i, (a0, b0, sv) in enumerate(bep_regions):
+                if b0 >= from_t: bep_regions[i] = (sc(a0), sc(b0), sv)
+            for k, v in list(step_times.items()):
+                if v >= from_t: step_times[k] = sc(v)
+            if cur_sh_t >= from_t: cur_sh_t = sc(cur_sh_t)
+
         for s in steps:
             step_times[s.step] = t
             a = s.action
 
             if a == "RAMP_TEMP":
                 try:
-                    ch = RecipeEngine._src_to_ch(str(s.param1 or ""))
                     rate = float(s.param2) if s.param2 else 4.0
-                    if ch == 1: se_rate = rate
-                    else:       sub_rate = rate
-                    rate_markers.append((t, rate, ch))
+                    if RecipeEngine._is_indium_src(s.param1):
+                        in_rate = rate          # timing only — In is not plotted
+                    else:
+                        ch = RecipeEngine._src_to_ch(str(s.param1 or ""))
+                        if ch == 1: se_rate = rate
+                        else:       sub_rate = rate
+                        rate_markers.append((t, rate, ch))
                 except: pass
                 snap()
 
             elif a == "SET_TEMP":
                 try:
                     p1 = s.param1
-                    if isinstance(p1, str) and any(c.isalpha() for c in p1):
-                        ch = RecipeEngine._src_to_ch(p1); target = float(s.param2)
+                    if RecipeEngine._is_indium_src(p1):
+                        target = float(s.param2)
+                        push(abs(target - in_t) / max(in_rate, 0.01) * 60.0); in_t = target
                     else:
-                        ch = 1; target = float(p1)
-                    if ch == 1:
-                        push(abs(target - se_t) / max(se_rate, 0.01) * 60.0); se_t = target
-                        pts_se[-1] = se_t
-                    else:
-                        push(abs(target - sub_t) / max(sub_rate, 0.01) * 60.0); sub_t = target
-                        pts_sub[-1] = sub_t
+                        if isinstance(p1, str) and any(c.isalpha() for c in p1):
+                            ch = RecipeEngine._src_to_ch(p1); target = float(s.param2)
+                        else:
+                            ch = 1; target = float(p1)
+                        if ch == 1:
+                            push(abs(target - se_t) / max(se_rate, 0.01) * 60.0); se_t = target
+                            pts_se[-1] = se_t
+                        else:
+                            push(abs(target - sub_t) / max(sub_rate, 0.01) * 60.0); sub_t = target
+                            pts_sub[-1] = sub_t
                 except: snap()
+
+            elif a == "INCREASE_TEMP":
+                try:
+                    delta = float(s.param2)
+                    if RecipeEngine._is_indium_src(s.param1):
+                        push(abs(delta) / max(in_rate, 0.01) * 60.0); in_t += delta
+                    else:
+                        ch = RecipeEngine._src_to_ch(str(s.param1 or ""))
+                        if ch == 1:
+                            push(abs(delta) / max(se_rate, 0.01) * 60.0); se_t += delta
+                            pts_se[-1] = se_t
+                        else:
+                            push(abs(delta) / max(sub_rate, 0.01) * 60.0); sub_t += delta
+                            pts_sub[-1] = sub_t
+                except: snap()
+
+            elif a == "MEASURE_BEP":
+                t0b = t
+                push(bep_duration(s.param1))
+                bep_regions.append((t0b, t, str(s.param1 or "Both")))
 
             elif a == "WAIT_TIME":
                 try: push(float(s.param1))
                 except: push(10)
+
+            elif a == "RHEED_VIDEO":            # blocks for the clip, like WAIT_TIME
+                try: push(max(float(s.param1), 0.0) or 1.0)
+                except: push(1.0)
 
             elif a in ("WAIT_TEMP","WAIT_PRESSURE"):
                 t0u=t; push(UNKNOWN_DT); unk_regions.append((t0u, t))
@@ -1843,16 +2409,29 @@ class MainWindow(QMainWindow):
                 try:
                     tgt   = int(float(s.param1))
                     loops = int(float(s.param2)) if s.param2 is not None else 1
-                    if tgt in step_times:
-                        goto_regions.append((step_times[tgt], t, f"?×{loops+1}"))
-                except: pass
-                snap()
+                    body_start = step_times.get(tgt)
+                    if body_start is None:
+                        snap()
+                    else:
+                        body_dur = max(0.0, t - body_start)
+                        passes   = max(1, loops + 1)
+                        if body_dur > 0 and passes > 1:
+                            stretch(body_start, passes)   # widen the one cycle to fill the loop
+                            t = body_start + body_dur*passes
+                        else:
+                            snap()
+                        goto_regions.append(
+                            (body_start, t,
+                             f"×{passes}  ({fmt_duration(body_dur*passes)})\n"
+                             f"cycle length: {fmt_duration(body_dur)}"))
+                except: snap()
 
             else:
                 snap()   # HEATER_ON/OFF, IG_ON/OFF, END — no time advance
 
         flush_sh()
-        return pts_t, pts_se, pts_sub, shutter_segs, rate_markers, goto_regions, unk_regions
+        return (pts_t, pts_se, pts_sub, shutter_segs, rate_markers,
+                goto_regions, unk_regions, bep_regions)
 
     def _refresh_recipe_preview(self):
         if not HAS_PG or self._rp_plot is None: return
@@ -1867,7 +2446,7 @@ class MainWindow(QMainWindow):
             self._rp_se.setData([],[]); self._rp_sub.setData([],[])
             return
 
-        pts_t, pts_se, pts_sub, shutters, rmarks, gotos, unks = \
+        pts_t, pts_se, pts_sub, shutters, rmarks, gotos, unks, beps = \
             self._simulate_recipe_timeline(steps)
 
         self._rp_se.setData(pts_t, pts_se)
@@ -1878,9 +2457,9 @@ class MainWindow(QMainWindow):
         # ── Shutter backgrounds ──────────────────────────────────────
         for t0, t1, in_s, se_s in shutters:
             if not (in_s or se_s) or t1 <= t0: continue
-            if in_s and se_s: col="#22cc55"    # both: green
-            elif in_s:        col="#22ee44"    # In only: bright green
-            else:             col="#ee6622"    # Se only: orange-red
+            if in_s and se_s: col=BL           # both sources open: blue
+            elif in_s:        col=SRC_IN_C     # In only: green
+            else:             col=SRC_SE_C     # Se only: orange
             bc=pg.mkColor(col); bc.setAlpha(50)
             rgn=pg.LinearRegionItem((t0,t1),movable=False,brush=pg.mkBrush(bc))
             ec=pg.mkColor(col); ec.setAlpha(160)
@@ -1894,6 +2473,23 @@ class MainWindow(QMainWindow):
             rgn=pg.LinearRegionItem((t0,t1),movable=False,brush=pg.mkBrush(bc))
             for ln in rgn.lines: ln.setPen(pg.mkPen("#888888",width=1,style=Qt.DotLine))
             self._rp_plot.addItem(rgn); self._rp_items.append(rgn)
+
+        # ── BEP measurement windows (silver, labelled per source) ────
+        for t0, t1, src in beps:
+            if t1 <= t0: continue
+            bc=pg.mkColor(BEP_C); bc.setAlpha(70)
+            rgn=pg.LinearRegionItem((t0,t1),movable=False,brush=pg.mkBrush(bc))
+            for ln in rgn.lines: ln.setPen(pg.mkPen("#e8e8e8",width=1))
+            self._rp_plot.addItem(rgn); self._rp_items.append(rgn)
+            sl_=str(src or "Both").strip().lower()
+            want_in = sl_.startswith("in") or "both" in sl_
+            want_se = sl_.startswith("se") or "both" in sl_
+            tags = ([("In",SRC_IN_C)] if want_in else []) + ([("Se",SRC_SE_C)] if want_se else [])
+            for k,(txt,col) in enumerate(tags):
+                ti=pg.TextItem(txt,color=col,anchor=(0.5,0.5))
+                ti.setFont(QFont("Arial",9,QFont.Bold))
+                ti.setPos((t0+t1)/2, y_top*(0.55-0.09*k))
+                self._rp_plot.addItem(ti); self._rp_items.append(ti)
 
         # ── GOTO loop regions ────────────────────────────────────────
         for t0, t1, label in gotos:
@@ -1925,6 +2521,7 @@ class MainWindow(QMainWindow):
         if not path: return
         try:
             steps=self.recipe.load_excel(path); self._rtab_populate(steps)
+            self._recipe_path=path
             self.rf.setText(os.path.basename(path)); self.rrun.setEnabled(True); self._log(f"Recipe: {os.path.basename(path)} ({len(steps)} steps)")
         except Exception as e: QMessageBox.critical(self,"Load Error",str(e))
 
@@ -1954,18 +2551,83 @@ class MainWindow(QMainWindow):
         self.rec_log.bep_in=self.bep.last_in_bep; self.rec_log.bep_se=self.bep.last_se_bep; self.rec_log.bep_ratio=self.bep.se_in_ratio
         self.rec_log.bep_trace_in=self.bep.trace_in; self.rec_log.bep_trace_se=self.bep.trace_se
         self._sync_p_idx = 0; self._sync_t_idx = 0  # reset sync indices for fresh run
-        self.rec_log.start(name.strip())
-        self._log(f"🟢 Run started: <b>{name.strip()}</b>  ({len(steps)} steps)")
+        # Loop-aware duration estimate drives the progress bar / time-left / ETA
+        try:
+            pts_t = self._simulate_recipe_timeline(steps)[0]
+            self._run_est = pts_t[-1] if pts_t else 0.0
+        except Exception:
+            self._run_est = 0.0
+        self._run_t0 = time.time()
+        self.rprog.setValue(0); self.rloop.setText("—")
+        self.rec_log.start(name.strip()); self._rheed_n=0   # RHEED_VIDEO numbering per run
+        est_txt = f"  ~{fmt_duration(self._run_est)} est." if self._run_est > 0 else ""
+        self._log(f"🟢 Run started: <b>{name.strip()}</b>  ({len(steps)} steps){est_txt}")
         self.recipe.start()
 
     def _r_stop(self):
         self.recipe.stop()
         if self.rec_log.running:
             self.rec_log.stop()
-            def _export():
-                os.makedirs(_LOG_DIR, exist_ok=True); path=self.rec_log.export_excel(_LOG_DIR)
-                if path: QTimer.singleShot(0,lambda:self._log(f"📊 Run log saved → {path}"))
-            threading.Thread(target=_export,daemon=True).start()
+            self._export_run_log()
+
+    # ── Run progress / loop tracking ───────────────────────────────────
+    def _update_run_progress(self):
+        """1 Hz: refresh the progress bar, time-left and ETA during a run.
+
+        Total comes from the same loop-aware estimate that draws the preview, so
+        WAIT_TEMP / WAIT_PRESSURE (unknowable ahead of time — 120 s placeholder)
+        make it approximate; the labels say 'est.' so nobody reads it as gospel.
+        """
+        if self.recipe.state not in (RecipeEngine.STATE_RUNNING, RecipeEngine.STATE_PAUSED):
+            return
+        if not self._run_t0:
+            return
+        el = time.time() - self._run_t0
+        if self._run_est > 0:
+            self.rprog.setValue(max(0, min(100, int(el / self._run_est * 100))))
+            left = max(0.0, self._run_est - el)
+            self.rleft.setText(f"Elapsed: {fmt_duration(el)}   •   Time left: {fmt_duration(left)} (est.)")
+            self.reta.setText("Est. done: " + time.strftime("%H:%M:%S", time.localtime(time.time()+left)))
+        else:
+            self.rleft.setText(f"Elapsed: {fmt_duration(el)}")
+            self.reta.setText("Est. done: —")
+
+    def _reset_run_progress(self):
+        self._run_t0=None; self._run_est=0.0
+        self.rprog.setValue(0); self.rloop.setText("—")
+        self.rleft.setText("Time left: —"); self.reta.setText("Est. done: —")
+
+    def _current_loop_info(self, row):
+        """(current_pass, total_passes) if `row` sits inside a GOTO loop body, else None.
+
+        Engine semantics (recipe_engine._exec GOTO): the counter is created at
+        `loops` on first arrival and decremented BEFORE each jump, so a remaining
+        of loops-k means we are on pass k+1; an absent key means the GOTO has not
+        been reached yet (pass 1).  Innermost loop wins when loops are nested.
+        """
+        best=None; best_start=-1
+        for g in range(self.rtab.rowCount()):
+            cb=self.rtab.cellWidget(g,1)
+            if not cb or cb.currentText()!="GOTO": continue
+            w1=self.rtab.cellWidget(g,2); it1=self.rtab.item(g,2); it2=self.rtab.item(g,3)
+            p1=w1.currentText() if w1 else (it1.text() if it1 else "")
+            p2=it2.text() if it2 else ""
+            try:
+                tgt=int(float(p1)); loops=int(float(p2)) if p2 else 0
+            except (ValueError, TypeError):
+                continue
+            # _rtab_to_steps numbers steps by row order, so step N is row N-1
+            start=tgt-1
+            if loops<=0 or not (0<=start<=row<=g): continue
+            remaining=self.recipe._loop_counters.get(g)
+            cur=1 if remaining is None else max(1, loops-remaining+1)
+            if start>best_start:
+                best_start=start; best=(cur, loops+1)
+        return best
+
+    def _update_loop_label(self, row):
+        info=self._current_loop_info(row)
+        self.rloop.setText(f"{info[0]}/{info[1]}" if info else "—")
 
     # ── Recipe row highlighting ────────────────────────────────────────
     _HL_ROW_BG = "#3d2e00"    # active row background — must match ::item:selected CSS
@@ -2040,6 +2702,7 @@ class MainWindow(QMainWindow):
                     current_pass = 1   # first time reaching this GOTO
                 detail += f"  [{current_pass}/{total_execs}]"
             self.rsk.setText(f"Step {step_num}: {action}{detail}")
+            self._update_loop_label(i)
             self._log(f"<span style='color:#50fa7b;font-weight:bold'>▶ Step {step_num}: {action}{detail}</span>")
     def _r_state(self, s):
         icon = {"RUNNING":"🟢","PAUSED":"🟡","DONE":"✅","ERROR":"❌","IDLE":"⬜"}.get(s,"")
@@ -2050,13 +2713,11 @@ class MainWindow(QMainWindow):
             self.rsk.setText("—")
             self._set_recipe_row_active(self._active_recipe_row, False)
             self._active_recipe_row = -1
+            self._reset_run_progress()
         # Auto-save log when recipe completes or errors
         if s in ("DONE","ERROR") and self.rec_log.running:
             self.rec_log.stop()
-            def _export():
-                os.makedirs(_LOG_DIR, exist_ok=True); path=self.rec_log.export_excel(_LOG_DIR)
-                if path: QTimer.singleShot(0,lambda:self._log(f"📊 Run log saved → {path}"))
-            threading.Thread(target=_export,daemon=True).start()
+            self._export_run_log()
         # Resume live logging if it was running before the recipe
         if idle and getattr(self,"_log_was_running",False):
             self._log_was_running = False
@@ -2220,7 +2881,36 @@ class MainWindow(QMainWindow):
         if path:
             with open(path,"w") as f: f.write(ARDUINO_FIRMWARE.strip()); self._log(f"Firmware → {path}")
 
+    def _export_run_log(self):
+        """Write the run .xlsx to <LOG_ROOT>/deposition on a worker thread. wb.save() raises
+        if Box is offline/locked — that used to kill the thread silently and LOSE the
+        run log; now it falls back to the local logs/deposition and says so."""
+        def work():
+            d = log_paths.ensure(log_paths.DEPOSITION_DIR, log_paths.LOCAL_DEPOSITION_DIR)
+            try:
+                path = self.rec_log.export_excel(d)
+                msg = f"📊 Run log saved → {path}" if path else "⚠ Run log not saved (openpyxl missing)"
+            except Exception as e:
+                try:
+                    os.makedirs(log_paths.LOCAL_DEPOSITION_DIR, exist_ok=True)
+                    path = self.rec_log.export_excel(log_paths.LOCAL_DEPOSITION_DIR)
+                    msg = (f"<span style='color:{OR}'>⚠ Could not save the run log to {d} ({e}) — "
+                           f"saved locally → {path}. Copy it to Box later.</span>")
+                except Exception as e2:
+                    msg = f"<span style='color:{RD}'>✗ RUN LOG NOT SAVED: {e2}</span>"
+            self._logb.msg.emit(msg)
+        threading.Thread(target=work, name="RunLog-export", daemon=True).start()
+
+    def _logger_notes(self):
+        for n in self.logger.pop_notes():
+            self._log(f"<span style='color:{OR}'>{n}</span>")
+
     def closeEvent(self, e):
+        if getattr(self,"rheed_tab",None) is not None:
+            self.rheed_tab.shutdown()          # camera + RHEED worker threads first
+        if getattr(self,"_rheed_win",None) is not None:
+            self._rheed_win.closed.disconnect(); self._rheed_win.close()
+        self.ln2.stop_scheduler()
         self.poller.stop()
         if self._plot_worker: self._plot_worker.stop()
         self.logger.stop_logging(); self.recipe.stop()
